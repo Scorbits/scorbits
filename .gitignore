@@ -23,3 +23,9 @@ static/miner.wasm
 *.log
 env.example
 static/miners/win/*.zip
+dist/
+releases/
+static/miners/linux/scorbits-miner-linux
+static/miners/mac/scorbits-miner-macos
+static/miners/*.zip
+static/wasm_exec.js
