@@ -1,0 +1,13 @@
+.env
+.env.save
+.env.save.1
+.env.local
+config.json
+scorbits_chain.json
+mempool.json
+static/uploads/
+static/miners/
+static/nodes/
+*.log
+CLAUDE.md
+context.md

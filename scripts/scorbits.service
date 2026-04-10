@@ -1,0 +1,17 @@
+[Unit]
+Description=Scorbits Node
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5
+User=ubuntu
+WorkingDirectory=/opt/scorbits
+ExecStart=/opt/scorbits/scorbits node -port 3000 -peers ""
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

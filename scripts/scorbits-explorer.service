@@ -1,0 +1,17 @@
+[Unit]
+Description=Scorbits Explorer
+After=network.target scorbits.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5
+User=ubuntu
+WorkingDirectory=/opt/scorbits
+ExecStart=/opt/scorbits/scorbits explorer 8080
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
