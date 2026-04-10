@@ -3,7 +3,6 @@
 .env.save.1
 config.json
 .claude/
-CONTEXT.md
 Readme.md
 scorbits_chain.json
 mempool.json
