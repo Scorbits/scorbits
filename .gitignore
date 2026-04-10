@@ -2,7 +2,6 @@
 .env.save
 .env.save.1
 config.json
-.claude/
 Readme.md
 scorbits_chain.json
 mempool.json
