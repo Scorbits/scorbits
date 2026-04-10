@@ -21,3 +21,5 @@ static/miners/win/scorbits-miner-windows.exe
 static/nodes/
 static/miner.wasm
 *.log
+env.example
+static/miners/win/*.zip
