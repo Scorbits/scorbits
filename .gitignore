@@ -27,3 +27,7 @@ static/miners/linux/scorbits-miner-linux
 static/miners/mac/scorbits-miner-macos
 static/miners/*.zip
 static/wasm_exec.js
+
+# Compiled binaries
+pool
+scorbits
