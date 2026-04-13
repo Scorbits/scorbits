@@ -184,10 +184,17 @@ func (n *Node) handleMessage(msg Message, conn net.Conn) {
 		n.mu.Lock()
 		last := n.Blockchain.GetLastBlock()
 
-		// Anti-spike : timestamp au moins 10s après le bloc précédent
-		if block.Timestamp < last.Timestamp+10 {
+		// Anti-spike : timestamp au moins 120s après le bloc précédent
+		if block.Timestamp < last.Timestamp+120 {
 			n.mu.Unlock()
 			fmt.Printf("[Sécurité] Bloc rejeté : anti-spike (timestamp trop proche)\n")
+			return
+		}
+
+		// Anti-consecutive : refuser si ce mineur a déjà trouvé les 2 derniers blocs
+		if n.Blockchain.IsConsecutiveMiner(block.MinerAddress) {
+			n.mu.Unlock()
+			fmt.Printf("[Anti-consecutive] Bloc refusé pour %s — 2 blocs consécutifs atteints\n", block.MinerAddress)
 			return
 		}
 
@@ -202,10 +209,25 @@ func (n *Node) handleMessage(msg Message, conn net.Conn) {
 
 		accepted := false
 		if block.PreviousHash == last.Hash && block.Hash == block.CalculateHash() {
+			// Vérifier que le hash respecte la difficulté actuelle du serveur
+			requiredDiff := strings.Repeat("0", n.Blockchain.Difficulty)
+			if !strings.HasPrefix(block.Hash, requiredDiff) {
+				n.mu.Unlock()
+				fmt.Printf("[Sécurité] Bloc #%d rejeté : difficulté insuffisante (hash: %s, requis: %d zéros)\n", block.Index, block.Hash[:16], n.Blockchain.Difficulty)
+				return
+			}
 			n.Blockchain.Blocks = append(n.Blockchain.Blocks, &block)
 			n.Blockchain.TotalSupply += block.Reward
 			fmt.Printf("[Nœud:%s] Nouveau bloc #%d accepté\n", n.Port, block.Index)
+			// Préserver la difficulté forcée
+			savedDiff := n.Blockchain.Difficulty
+			savedForced := n.Blockchain.DifficultyForced
 			n.Blockchain.Save()
+			// Restaurer si forcée
+			if savedForced {
+				n.Blockchain.Difficulty = savedDiff
+				n.Blockchain.DifficultyForced = savedForced
+			}
 			accepted = true
 		}
 		n.mu.Unlock()

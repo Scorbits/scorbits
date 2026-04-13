@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"crypto/sha256"
@@ -106,7 +107,17 @@ type Explorer struct {
 	node    *network.Node
 	chatHub *ChatHub
 
-	mineMu sync.Mutex // protège bc.Blocks contre les soumissions concurrentes
+	mineMu              sync.Mutex // protège bc.Blocks contre les soumissions concurrentes
+	lastBlockAcceptedAt int64      // timestamp réel serveur du dernier bloc accepté
+
+	minerMu         sync.Mutex       // protège minerLastSubmit
+	minerLastSubmit map[string]int64 // adresse -> timestamp dernière soumission acceptée
+
+	activeMinersMu sync.Mutex
+	activeMiners   map[string]int64 // adresse mineur ou IP -> timestamp dernier /mining/work
+
+	lastAdjustTime  int64 // timestamp serveur du dernier ajustement de difficulté
+	lastAdjustBlock int   // index (len) de la chaîne au dernier ajustement
 
 	rlLogin    *RateLimiter
 	rlRegister *RateLimiter
@@ -120,15 +131,20 @@ func NewExplorer(bc *blockchain.Blockchain, mp *mempool.Mempool, port string) *E
 		nodePort = "3000"
 	}
 	return &Explorer{
-		bc:         bc,
-		mp:         mp,
-		port:       port,
-		node:       network.NewNode(nodePort, bc),
-		chatHub:    NewChatHub(),
-		rlLogin:    newRateLimiter(5, time.Minute),
-		rlRegister: newRateLimiter(3, 10*time.Minute),
-		rlSend:     newRateLimiter(10, time.Minute),
-		rlMine:     newRateLimiter(60, time.Minute),
+		bc:                  bc,
+		mp:                  mp,
+		port:                port,
+		node:                network.NewNode(nodePort, bc),
+		chatHub:             NewChatHub(),
+		rlLogin:             newRateLimiter(5, time.Minute),
+		rlRegister:          newRateLimiter(3, 10*time.Minute),
+		rlSend:              newRateLimiter(10, time.Minute),
+		rlMine:              newRateLimiter(60, time.Minute),
+		lastBlockAcceptedAt: time.Now().Unix() - 120,
+		minerLastSubmit:     make(map[string]int64),
+		activeMiners:        make(map[string]int64),
+		lastAdjustTime:      time.Now().Unix(),
+		lastAdjustBlock:     len(bc.Blocks),
 	}
 }
 
@@ -148,6 +164,21 @@ func (e *Explorer) Start() error {
 	go e.chatHub.Run()
 	go e.startChatCleanup()
 
+	// Nettoyage des mineurs actifs toutes les 5 minutes
+	go func() {
+		for {
+			time.Sleep(5 * time.Minute)
+			cutoff := time.Now().Unix() - 300
+			e.activeMinersMu.Lock()
+			for k, ts := range e.activeMiners {
+				if ts < cutoff {
+					delete(e.activeMiners, k)
+				}
+			}
+			e.activeMinersMu.Unlock()
+		}
+	}()
+
 	// SCO order payment checker
 	go e.startScoOrderChecker()
 	db.DeleteOldChatMessages()
@@ -155,6 +186,8 @@ func (e *Explorer) Start() error {
 	// Create uploads directories
 	os.MkdirAll("./static/uploads/profiles", 0755)
 	os.MkdirAll("./static/uploads/posts", 0755)
+	os.MkdirAll("./static/uploads/announcements", 0755)
+	os.MkdirAll("./static/uploads/chat", 0755)
 
 	mux := http.NewServeMux()
 
@@ -196,6 +229,7 @@ func (e *Explorer) Start() error {
 	mux.HandleFunc("/api/posts/react", e.apiPostsReact)
 	mux.HandleFunc("/api/posts/comments", e.apiPostsComments)
 	mux.HandleFunc("/api/notifications", e.apiNotifications)
+	mux.HandleFunc("/api/notifications/poll", e.apiNotificationsPoll)
 	mux.HandleFunc("/api/notifications/read", e.apiNotificationsReadAll)
 	mux.HandleFunc("/api/notifications/read/", e.apiNotificationsReadOne)
 	mux.HandleFunc("/api/leaderboard", e.apiLeaderboard)
@@ -267,17 +301,38 @@ func (e *Explorer) Start() error {
 	// P2P peers API
 	mux.HandleFunc("/api/admin/post/delete", e.apiAdminPostDelete)
 	mux.HandleFunc("/api/admin/comment/delete", e.apiAdminCommentDelete)
+	mux.HandleFunc("/api/comment/like", e.apiCommentLike)
+	mux.HandleFunc("/api/comment/reply", e.apiCommentReply)
 	mux.HandleFunc("/api/admin/chat/delete", e.apiAdminChatDelete)
+	mux.HandleFunc("/api/admin/set-difficulty", e.apiAdminSetDifficulty)
+	mux.HandleFunc("/api/admin/unforce-difficulty", e.apiAdminUnforceDifficulty)
+	mux.HandleFunc("/api/announcements", e.apiAnnouncements)
+	mux.HandleFunc("/api/announcements/upload", e.apiAnnouncementUpload)
+	mux.HandleFunc("/api/announcements/", e.apiAnnouncementByID)
+	mux.HandleFunc("/api/chat/upload-image", e.apiChatUploadImage)
+	mux.HandleFunc("/api/block-template", e.apiBlockTemplate)
+	mux.HandleFunc("/api/submit-block", e.apiSubmitBlock)
+	mux.HandleFunc("/api/pool-payout", e.apiPoolPayout)
 
 	mux.HandleFunc("/api/peers", e.apiPeers)
 	mux.HandleFunc("/api/peers/add", e.apiPeersAdd)
 	mux.HandleFunc("/api/peers/status", e.apiPeersStatus)
+
+	// Pool page
+	mux.HandleFunc("/pool", e.handlePool)
+	// Pool proxy (CORS-safe relay to localhost:3334)
+	mux.HandleFunc("/api/proxy/pool/stats", e.apiProxyPoolStats)
+	mux.HandleFunc("/api/proxy/pool/workers", e.apiProxyPoolWorkers)
+	mux.HandleFunc("/api/proxy/pool/blocks", e.apiProxyPoolBlocks)
+	mux.HandleFunc("/api/proxy/pool/balance", e.apiProxyPoolBalance)
 
 	// Node page
 	mux.HandleFunc("/node", e.handleNode)
 
 	// Wallets page
 	mux.HandleFunc("/wallets", e.handleWallets)
+	mux.HandleFunc("/transactions", e.handleTransactions)
+	mux.HandleFunc("/api/transactions", e.apiTransactions)
 
 	// i18n
 	mux.HandleFunc("/set-lang", i18n.HandleSetLang)
@@ -384,10 +439,10 @@ func (e *Explorer) handleHome(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, page(i18n.T(lang, "nav.explorer"), homeContent(last, len(e.bc.Blocks), e.bc.TotalSupply, rows, lang), "explorer", lang, user))
+	fmt.Fprint(w, page(i18n.T(lang, "nav.explorer"), homeContent(last, len(e.bc.Blocks), e.bc.TotalSupply, rows, lang, user), "explorer", lang, user))
 }
 
-func homeContent(last *blockchain.Block, totalBlocks, totalSupply int, rows string, lang string) string {
+func homeContent(last *blockchain.Block, totalBlocks, totalSupply int, rows string, lang string, user *db.User) string {
 	return fmt.Sprintf(`
 <div class="home-layout">
 
@@ -408,7 +463,10 @@ func homeContent(last *blockchain.Block, totalBlocks, totalSupply int, rows stri
     </div>
 
     <div style="text-align:center;margin:1rem 0 0.5rem;">
-      <a href="/wallet#buy" style="display:inline-block;background:#f5a623;color:#000;font-weight:700;padding:12px 32px;border-radius:8px;text-decoration:none;font-size:1rem;letter-spacing:0.02em;">Buy SCO</a>
+      <div style="display:flex;gap:0.6rem;justify-content:center;flex-wrap:wrap;">
+        <a href="/wallet#buy" style="display:inline-block;background:#f5a623;color:#000;font-weight:700;padding:12px 32px;border-radius:8px;text-decoration:none;font-size:1rem;letter-spacing:0.02em;">Buy SCO</a>
+        <a href="/transactions" style="display:inline-block;background:#f5a623;color:#000;font-weight:700;padding:12px 32px;border-radius:8px;text-decoration:none;font-size:1rem;letter-spacing:0.02em;">Transactions</a>
+      </div>
     </div>
 
     <div class="panel-title" style="margin-top:1.2rem">
@@ -416,15 +474,11 @@ func homeContent(last *blockchain.Block, totalBlocks, totalSupply int, rows stri
       `+i18n.T(lang, "home.current_block")+`
     </div>
     <div class="block-progress-wrap">
-      <div style="display:flex;justify-content:space-between;margin-bottom:0.2rem;">
+      <div style="display:flex;justify-content:space-between;margin-bottom:0.5rem;">
         <span style="font-size:0.78rem;color:var(--text2)">`+i18n.T(lang, "home.next")+`&#160;: <span id="bp-next" style="color:var(--green);font-weight:700">#%d</span></span>
         <span style="font-size:0.78rem;color:var(--text2)">`+i18n.T(lang, "home.diff")+`&#160;: <span id="bp-diff" style="color:var(--green);font-weight:700">%d</span></span>
       </div>
-      <div class="bp-bar-outer"><div id="bp-fill" class="bp-bar-fill"></div></div>
-      <div style="display:flex;justify-content:space-between;margin-top:0.25rem;">
-        <span id="bp-elapsed" class="bp-elapsed"></span>
-        <span id="bp-time" class="bp-time">`+i18n.T(lang, "home.computing")+`</span>
-      </div>
+      <span id="bp-elapsed" class="bp-elapsed"></span>
     </div>
 
     <div class="panel-title" style="margin-top:1.2rem">
@@ -432,6 +486,11 @@ func homeContent(last *blockchain.Block, totalBlocks, totalSupply int, rows stri
       `+i18n.T(lang, "home.latest_blocks")+`
     </div>
     <div class="block-list" id="block-list">%s</div>
+
+    <div style="margin-top:.9rem;padding:.65rem 1rem;background:#0d1f35;border:1px solid #1a3a5c;border-radius:8px;display:flex;align-items:center;justify-content:space-between;gap:.5rem;">
+      <span style="font-size:.8rem;color:#aac;">`+func() string { if lang == "fr" { return "Minez en commun avec le" }; return "Mine together with" }()+` <strong style="color:#00ff88;">Scorbits Pool</strong></span>
+      <a href="/pool" style="font-size:.75rem;padding:.3rem .7rem;background:#00ff88;color:#000;border-radius:5px;font-weight:700;text-decoration:none;white-space:nowrap;">`+func() string { if lang == "fr" { return "Rejoindre" }; return "Join" }()+`</a>
+    </div>
 
     <div class="panel-title" style="margin-top:1.2rem">
       <svg width="14" height="14" viewBox="0 0 14 14"><polygon points="7,1 9,5 13,5.5 10,8.5 10.5,13 7,11 3.5,13 4,8.5 1,5.5 5,5" fill="currentColor"/></svg>
@@ -461,10 +520,18 @@ func homeContent(last *blockchain.Block, totalBlocks, totalSupply int, rows stri
       <div class="chat-input-area" id="chat-input-area">
         <div class="chat-mentions-list hidden" id="chat-mentions"></div>
         <div class="chat-share-preview hidden" id="chat-share-preview"></div>
+        <div class="chat-media-preview hidden" id="chat-media-preview">
+          <button class="chat-media-cancel" onclick="cancelChatMedia()" title="Annuler">&#10005;</button>
+          <img id="chat-media-preview-img" src="" alt="" class="chat-media-preview-img">
+        </div>
         <div class="chat-toolbar">
           <button class="chat-emoji-btn" onclick="toggleEmojiPicker(event)" title="Emoji">😊</button>
           <button class="chat-gif-btn" onclick="toggleGifPicker(event)" title="GIF">GIF</button>
-          <input type="text" id="chat-input" class="chat-input" placeholder="`+i18n.T(lang, "chat.placeholder")+`" maxlength="500" autocomplete="off">
+          <label class="chat-img-btn" title="Photo">
+            📷
+            <input type="file" id="chat-img-input" accept="image/jpeg,image/png,image/gif" style="display:none" onchange="chatUploadImage(this)">
+          </label>
+          <input type="text" id="chat-input" class="chat-input" placeholder="`+i18n.T(lang, "chat.placeholder")+`" maxlength="5000" autocomplete="off">
           <button class="chat-send-btn" onclick="sendChatMsg()">➤</button>
         </div>
         <!-- Emoji picker -->
@@ -483,6 +550,66 @@ func homeContent(last *blockchain.Block, totalBlocks, totalSupply int, rows stri
       `+i18n.T(lang, "home.community_feed")+`
     </div>
     <div id="posts-feed" class="posts-feed"><div class="posts-loading">`+i18n.T(lang, "common.loading")+`</div></div>
+
+    <!-- Official Announcements -->
+    <div style="margin-top:1.5rem">
+      <div class="panel-title" style="margin-bottom:0.75rem">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+        `+i18n.T(lang, "home.announcements")+`
+        <span class="ann-badge">OFFICIAL</span>
+      </div>
+      `+func() string {
+		if user != nil && user.Pseudo == "Yousse" {
+			return `<div style="margin-bottom:0.75rem">
+        <button class="btn-green" onclick="openAnnModal()">+ New Announcement</button>
+      </div>`
+		}
+		return ""
+	}()+`
+      <div id="announcements-list"><div style="color:#555;font-size:.85rem">`+i18n.T(lang, "common.loading")+`</div></div>
+    </div>
+
+    <!-- Modal rich editor annonces -->
+    <div id="ann-modal" class="modal-overlay hidden" onclick="if(event.target===this)closeAnnModal()">
+      <div class="modal-box" style="max-width:640px;width:95%%;max-height:90vh;overflow-y:auto;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;">
+          <span style="font-weight:700;color:#fff">Announcement</span>
+          <button onclick="closeAnnModal()" style="background:none;border:none;color:var(--text2);cursor:pointer;font-size:1.2rem;">&#10005;</button>
+        </div>
+        <input id="ann-title" type="text" placeholder="Title" style="width:100%%;background:#111;border:1px solid #222;border-radius:6px;padding:.5rem;color:#fff;margin-bottom:.75rem;box-sizing:border-box">
+        <div class="ann-toolbar">
+          <button type="button" onclick="annCmd('bold')" title="Bold"><b>B</b></button>
+          <button type="button" onclick="annCmd('italic')" title="Italic"><i>I</i></button>
+          <button type="button" onclick="annCmd('underline')" title="Underline"><u>U</u></button>
+          <button type="button" onclick="annInsertLink()" title="Link">&#128279;</button>
+          <button type="button" onclick="annCmd('insertUnorderedList')" title="List">&#8226; List</button>
+          <label class="ann-toolbar-upload" title="Upload image">
+            &#128444; Image
+            <input type="file" id="ann-img-input" accept="image/*" style="display:none" onchange="annUploadImg(this)">
+          </label>
+        </div>
+        <div id="ann-editor" contenteditable="true" class="ann-editor" oninput="annUpdatePreview()" placeholder="Write your announcement here..."></div>
+        <div style="margin-top:.75rem;color:#555;font-size:.75rem;margin-bottom:.25rem">Preview:</div>
+        <div id="ann-preview" class="ann-preview"></div>
+        <div style="margin-top:.9rem;padding:.7rem;background:#071020;border:1px solid rgba(30,144,255,0.25);border-radius:7px;">
+          <div style="font-size:.75rem;color:#5a7a9a;margin-bottom:.4rem">Image de couverture (optionnel) :</div>
+          <div style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;">
+            <label style="display:inline-flex;align-items:center;gap:4px;background:#1e1e1e;border:1px solid #1e90ff44;border-radius:5px;padding:4px 10px;color:#aaa;cursor:pointer;font-size:.8rem;">
+              &#128248; Parcourir
+              <input type="file" id="ann-cover-input" accept="image/jpeg,image/png,image/gif,image/webp" style="display:none" onchange="annUploadCover(this)">
+            </label>
+            <span id="ann-cover-name" style="font-size:.75rem;color:#7a8fa6;"></span>
+            <button id="ann-cover-remove" onclick="annRemoveCover()" style="display:none;background:none;border:none;color:#e55;cursor:pointer;font-size:.75rem;">&#10005; Retirer</button>
+          </div>
+          <div id="ann-cover-preview" style="margin-top:.5rem;"></div>
+        </div>
+        <div style="display:flex;gap:.5rem;margin-top:1rem">
+          <button class="btn-green" onclick="submitAnn()">Publish</button>
+          <button onclick="closeAnnModal()" style="background:#1e1e1e;border:none;border-radius:6px;padding:.4rem .9rem;color:#aaa;cursor:pointer">Cancel</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Modal commentaires -->
     <div id="comments-modal" class="modal-overlay hidden" onclick="if(event.target===this)closeCommentsModal()">
       <div class="modal-box" style="max-width:480px;max-height:80vh;overflow-y:auto;">
@@ -573,7 +700,7 @@ function appendChatMsg(m, scroll=true) {
   div.innerHTML = `+"`"+`
     <div class="chat-msg-header">
       ${renderChatAvatar(m.avatar_url, m.pseudo, 36)}
-      <span class="chat-pseudo">${escHtml(m.pseudo)}</span>${minerBadge}
+      <span class="chat-pseudo">${escHtml(m.pseudo)}</span>${m.pseudo === 'Yousse' ? '<span class="scorbits-badge" title="Scorbits Official"><span>S</span></span>' : ''}${minerBadge}
       <span class="chat-time">${timeStr}</span>
       <span class="chat-actions">
         <button class="chat-react-btn" onclick="openReactPicker(event,'${m.id}')" title="React">😊</button>
@@ -584,14 +711,26 @@ function appendChatMsg(m, scroll=true) {
     <div class="chat-msg-body">${content}${gif}${m.shared_post ? renderSharedPost(m.shared_post) : ''}</div>
     <div class="chat-reactions" id="reactions-${m.id}">${reactions}</div>
   `+"`"+`;
+  if (m.content) {
+    const _tBtn = document.createElement('button');
+    _tBtn.textContent = LANG === 'fr' ? 'Traduire' : 'Translate';
+    _tBtn.style.cssText = 'background:none;border:none;color:#444;font-size:.72rem;cursor:pointer;padding:1px 4px;margin-top:2px;display:block;';
+    _tBtn.dataset.t = m.content;
+    _tBtn.onclick = function(){ translateMsg(this.dataset.t, this); };
+    const _body = div.querySelector('.chat-msg-body');
+    if (_body) _body.insertAdjacentElement('afterend', _tBtn);
+  }
   el.appendChild(div);
   if (scroll) el.scrollTop = el.scrollHeight;
 }
 function renderChatContent(text) {
   if (!text) return '';
+  // Inline chat image uploads
+  if (text.startsWith('/static/uploads/chat/')) {
+    return `+"`"+`<a href="${escHtml(text)}" target="_blank" rel="noopener"><img src="${escHtml(text)}" class="chat-img" loading="lazy"></a>`+"`"+`;
+  }
   let s = linkify(text);
   s = s.replace(/:sco:/g, '<img src="/static/scorbits_logo.png" style="height:18px;width:auto;vertical-align:middle">');
-  s = s.replace(/@(\w+)/g, '<span class="chat-mention">@$1</span>');
   return s;
 }
 function renderTextLinks(text) {
@@ -624,27 +763,84 @@ function renderReactions(reactions, msgId) {
   }).join('');
 }
 let pendingSharedPostId = null;
+let _pendingChatImgUrl = ''; // uploaded image URL waiting to be sent
+let _pendingChatGifUrl = ''; // gif URL waiting to be sent
+
+function _showChatMediaPreview(url) {
+  const box = document.getElementById('chat-media-preview');
+  const img = document.getElementById('chat-media-preview-img');
+  if (!box || !img) return;
+  img.src = url;
+  box.classList.remove('hidden');
+}
+function cancelChatMedia() {
+  _pendingChatImgUrl = '';
+  _pendingChatGifUrl = '';
+  const box = document.getElementById('chat-media-preview');
+  const img = document.getElementById('chat-media-preview-img');
+  if (box) box.classList.add('hidden');
+  if (img) img.src = '';
+  const inp = document.getElementById('chat-img-input');
+  if (inp) inp.value = '';
+}
 async function sendChatMsg() {
   if (!IS_LOGGED_IN) { window.location='/wallet'; return; }
   const inp = document.getElementById('chat-input');
-  const gifUrl = inp.dataset.gif || '';
   const text = inp.value.trim();
-  if (!text && !gifUrl && !pendingSharedPostId) return;
+  const gifUrl = _pendingChatGifUrl || '';
+  const imgUrl = _pendingChatImgUrl || '';
+  if (!text && !gifUrl && !imgUrl && !pendingSharedPostId) return;
   try {
-    await fetch('/api/chat', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({content: text, gif_url: gifUrl, shared_post_id: pendingSharedPostId || ''})});
+    if (imgUrl) {
+      // Send image as content, then text separately if present
+      await fetch('/api/chat', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({content: imgUrl, gif_url: '', shared_post_id: pendingSharedPostId || ''})});
+      if (text) {
+        await fetch('/api/chat', {method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({content: text, gif_url: '', shared_post_id: ''})});
+      }
+    } else {
+      await fetch('/api/chat', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({content: text, gif_url: gifUrl, shared_post_id: pendingSharedPostId || ''})});
+    }
     inp.value = '';
-    delete inp.dataset.gif;
+    cancelChatMedia();
     document.getElementById('gif-picker').classList.add('hidden');
     cancelSharePost();
   } catch(e) {}
 }
+async function chatUploadImage(input) {
+  if (!IS_LOGGED_IN) { window.location='/wallet'; return; }
+  if (!input.files || !input.files[0]) return;
+  const file = input.files[0];
+  if (file.size > 5 * 1024 * 1024) { alert('Image too large (max 5MB)'); input.value = ''; return; }
+  const fd = new FormData();
+  fd.append('image', file);
+  try {
+    const res = await fetch('/api/chat/upload-image', {method:'POST', body:fd});
+    const data = await res.json();
+    if (data.url) {
+      _pendingChatImgUrl = data.url;
+      _pendingChatGifUrl = '';
+      _showChatMediaPreview(data.url);
+      document.getElementById('chat-input').focus();
+    } else {
+      alert('Upload failed');
+    }
+  } catch(e) { alert('Upload error'); }
+  input.value = '';
+}
+window.chatUploadImage = chatUploadImage;
+window.cancelChatMedia = cancelChatMedia;
 document.addEventListener('DOMContentLoaded', () => {
   const inp = document.getElementById('chat-input');
   if (inp) {
     inp.addEventListener('keydown', e => { if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChatMsg();} });
-    inp.addEventListener('input', handleMentionInput);
+    setupMentionAC(inp, document.getElementById('chat-mentions'));
   }
+  // Wire mention autocomplete for publish modal textarea
+  const pubTa = document.getElementById('publish-content');
+  if (pubTa) setupMentionAC(pubTa, document.getElementById('publish-mentions'));
   connectChatWS();
   buildEmojiPicker('emoji-picker', emoji => {
     const inp = document.getElementById('chat-input');
@@ -657,29 +853,55 @@ document.addEventListener('DOMContentLoaded', () => {
     reactPickerTarget = null;
   });
 });
-function handleMentionInput() {
-  const inp = document.getElementById('chat-input');
-  const list = document.getElementById('chat-mentions');
-  if (!inp || !list) return;
-  const val = inp.value;
-  const atIdx = val.lastIndexOf('@');
-  if (atIdx < 0 || val.slice(atIdx).includes(' ')) { list.classList.add('hidden'); return; }
-  const q = val.slice(atIdx+1).toLowerCase();
-  const matches = chatKnownPseudos.filter(p => p.toLowerCase().startsWith(q)).slice(0,6);
-  if (!matches.length) { list.classList.add('hidden'); return; }
-  list.innerHTML = matches.map(p=>`+"`"+`<div class="mention-item" onclick="insertMention('${escHtml(p)}')">@${escHtml(p)}</div>`+"`"+`).join('');
-  list.classList.remove('hidden');
+// ── Generic @mention autocomplete ──
+let _macInp = null, _macDrop = null, _macTimer = null;
+function setupMentionAC(inp, drop) {
+  if (!inp || !drop || inp._mentionACSet) return;
+  inp._mentionACSet = true;
+  inp.addEventListener('input', () => triggerMentionAC(inp, drop));
+  inp.addEventListener('keydown', e => { if (e.key === 'Escape') drop.classList.add('hidden'); });
+  inp.addEventListener('blur', () => setTimeout(() => { if (drop) drop.classList.add('hidden'); }, 200));
 }
-const chatKnownPseudos = [];
+async function triggerMentionAC(inp, drop) {
+  _macInp = inp; _macDrop = drop;
+  const pos = inp.selectionStart !== undefined ? inp.selectionStart : inp.value.length;
+  const before = inp.value.slice(0, pos);
+  const atIdx = before.lastIndexOf('@');
+  if (atIdx < 0) { drop.classList.add('hidden'); return; }
+  const partial = before.slice(atIdx + 1);
+  if (partial.includes(' ') || partial.length < 1) { drop.classList.add('hidden'); return; }
+  clearTimeout(_macTimer);
+  _macTimer = setTimeout(async () => {
+    try {
+      const res = await fetch('/api/users/search?q=' + encodeURIComponent(partial));
+      const users = await res.json();
+      if (!Array.isArray(users) || !users.length) { drop.classList.add('hidden'); return; }
+      drop.innerHTML = users.slice(0, 6).map(u =>
+        '<div class="mention-item" onmousedown="insertMentionAC(event,\'' + escHtml(u.pseudo) + '\')">@' + escHtml(u.pseudo) + '</div>'
+      ).join('');
+      drop.classList.remove('hidden');
+    } catch(e) { drop.classList.add('hidden'); }
+  }, 200);
+}
+function insertMentionAC(event, pseudo) {
+  event.preventDefault();
+  if (!_macInp) return;
+  const pos = _macInp.selectionStart !== undefined ? _macInp.selectionStart : _macInp.value.length;
+  const val = _macInp.value;
+  const before = val.slice(0, pos);
+  const atIdx = before.lastIndexOf('@');
+  const newVal = val.slice(0, atIdx) + '@' + pseudo + ' ' + val.slice(pos);
+  _macInp.value = newVal;
+  const newPos = atIdx + pseudo.length + 2;
+  try { _macInp.setSelectionRange(newPos, newPos); } catch(e) {}
+  _macInp.focus();
+  if (_macDrop) _macDrop.classList.add('hidden');
+}
 function insertMention(pseudo) {
-  const inp = document.getElementById('chat-input');
-  if (!inp) return;
-  const val = inp.value;
-  const atIdx = val.lastIndexOf('@');
-  inp.value = val.slice(0, atIdx) + '@' + pseudo + ' ';
-  document.getElementById('chat-mentions').classList.add('hidden');
-  inp.focus();
+  if (_macInp) { insertMentionAC({preventDefault:()=>{}}, pseudo); }
 }
+window.insertMentionAC = insertMentionAC;
+window.insertMention = insertMention;
 function positionEmojiPicker(triggerBtn, pickerEl) {
   const rect = triggerBtn.getBoundingClientRect();
   const pickerHeight = 380;
@@ -862,10 +1084,12 @@ function searchGifs(q) {
   gifSearchTimeout = setTimeout(() => loadGifs(q), 600);
 }
 function selectGif(url) {
-  const inp = document.getElementById('chat-input');
-  if (inp) { inp.dataset.gif = url; inp.placeholder = 'GIF ready — type a message or send'; }
+  _pendingChatGifUrl = url;
+  _pendingChatImgUrl = '';
+  _showChatMediaPreview(url);
   document.getElementById('gif-picker').classList.add('hidden');
-  sendChatMsg();
+  const inp = document.getElementById('chat-input');
+  if (inp) inp.focus();
 }
 
 // ── Emoji picker builder ──
@@ -960,12 +1184,13 @@ async function loadPosts() {
         '<div class="post-header">'+
           '<span class="post-avatar" onclick="openProfileModal(\''+escHtml(p.pseudo)+'\')" title="@'+escHtml(p.pseudo)+'">'+p.avatar_svg+'</span>'+
           '<div class="post-meta">'+
-            '<span class="post-pseudo" onclick="openProfileModal(\''+escHtml(p.pseudo)+'\')">@'+escHtml(p.pseudo)+'</span>'+
+            '<span class="post-pseudo" onclick="openProfileModal(\''+escHtml(p.pseudo)+'\')">@'+escHtml(p.pseudo)+(p.pseudo==='Yousse'?'<span class="scorbits-badge" title="Scorbits Official"><span>S</span></span>':'')+'</span>'+
             '<span class="post-age">'+relAge(p.created_at)+'</span>'+
           '</div>'+
           delBtn+
         '</div>'+
         '<div class="post-content">'+renderTextLinks(p.content)+'</div>'+
+        (p.content ? '<button onclick="translateMsg(this.dataset.t,this)" data-t="'+escHtml(p.content||'').replace(/"/g,'&quot;')+'" style="background:none;border:none;color:#444;font-size:.72rem;cursor:pointer;padding:1px 4px;margin-top:2px;display:block;">'+(LANG==='fr'?'Traduire':'Translate')+'</button>' : '')+
         (p.image_url?'<img class="post-image" src="'+escHtml(p.image_url)+'" loading="lazy" onclick="openImageLightbox(this.src)">':'')+
         (p.gif_url?'<img class="post-image" src="'+escHtml(p.gif_url)+'" loading="lazy" onclick="openImageLightbox(this.src)">':'')+
         '<div class="post-actions">'+
@@ -976,8 +1201,11 @@ async function loadPosts() {
           (IS_LOGGED_IN ? '<button class="post-share-btn" onclick="sharePostToChat(\''+p.id+'\',\''+escHtml(p.pseudo)+'\')" title="'+I18N['chat.share_to_chat']+'">&#x1F4AC; '+I18N['chat.share_to_chat']+'</button>' : '')+
         '</div>'+
         '<div class="post-comment-box hidden" id="pcb-'+p.id+'">'+
-          '<div style="display:flex;gap:0.4rem;margin-top:0.5rem;">'+
-            '<input type="text" class="post-comment-input" id="pci-'+p.id+'" placeholder="'+I18N['common.comment_placeholder']+'" maxlength="200" onkeydown="if(event.key===\'Enter\')submitComment(\''+p.id+'\')">'+
+          '<div style="display:flex;gap:0.4rem;margin-top:0.5rem;align-items:center;">'+
+            '<div style="flex:1;position:relative;">'+
+              '<input type="text" class="post-comment-input" id="pci-'+p.id+'" placeholder="'+I18N['common.comment_placeholder']+'" maxlength="200" onkeydown="if(event.key===\'Enter\')submitComment(\''+p.id+'\')">'+
+              '<div class="chat-mentions-list hidden" id="pcm-'+p.id+'" style="bottom:auto;top:100%%;z-index:100"></div>'+
+            '</div>'+
             '<button class="post-comment-submit" onclick="submitComment(\''+p.id+'\')">'+I18N['common.send_btn']+'</button>'+
           '</div>'+
         '</div>'+
@@ -1052,7 +1280,13 @@ function toggleCommentBox(postId) {
   const box = document.getElementById('pcb-'+postId);
   if(!box) return;
   const hidden = box.classList.toggle('hidden');
-  if(!hidden) { const inp = document.getElementById('pci-'+postId); if(inp) inp.focus(); }
+  if(!hidden) {
+    const inp = document.getElementById('pci-'+postId);
+    if(inp) {
+      inp.focus();
+      setupMentionAC(inp, document.getElementById('pcm-'+postId));
+    }
+  }
 }
 async function submitComment(postId) {
   const inp = document.getElementById('pci-'+postId);
@@ -1064,7 +1298,92 @@ async function submitComment(postId) {
     document.getElementById('pcb-'+postId).classList.add('hidden');
   } catch(e) {}
 }
+function renderCommentItem(c, postId, isReply) {
+  const isOwn = IS_LOGGED_IN && c.pseudo === CURRENT_PSEUDO;
+  const likes = c.likes || [];
+  const likeCount = likes.length;
+  const isLiked = IS_LOGGED_IN && likes.includes(CURRENT_USER_ID);
+  const likeStyle = isLiked ? 'color:#00e85a;font-weight:700' : 'color:#888';
+  const indent = isReply ? 'margin-left:2rem;border-left:2px solid #1e1e1e;padding-left:.75rem;' : '';
+  const replies = c.replies || [];
+
+  const delBtn = !isReply && (isOwn
+    ? '<button class="post-delete-btn" onclick="deleteComment(\''+c.id+'\',this)" title="Supprimer" style="margin-left:auto;align-self:flex-start">&#128465;</button>'
+    : (IS_ADMIN ? '<button class="admin-del" onclick="adminDeleteComment(\''+c.id+'\',this)" title="Supprimer (admin)" style="margin-left:auto;align-self:flex-start">✕</button>' : ''));
+
+  const actionBtns = '<div class="cmt-actions">'+
+    '<button class="cmt-like-btn" id="cmt-like-'+c.id+'" style="'+likeStyle+'" onclick="toggleCommentLike(\''+c.id+'\',\''+postId+'\')">'+
+      '👍 <span id="cmt-like-count-'+c.id+'">'+likeCount+'</span>'+
+    '</button>'+
+    (!isReply && IS_LOGGED_IN ? '<button class="cmt-reply-btn" onclick="toggleReplyBox(\''+c.id+'\',\''+postId+'\')">↩ '+(LANG==='fr'?'Répondre':'Reply')+'</button>' : '')+
+  '</div>';
+
+  const replyBox = !isReply ? '<div id="cmt-reply-box-'+c.id+'" class="cmt-reply-box hidden">'+
+    '<div style="flex:1;position:relative;">'+
+      '<input type="text" id="cmt-reply-inp-'+c.id+'" class="post-comment-input" placeholder="'+(LANG==='fr'?'Votre réponse...':'Your reply...')+'" maxlength="500" '+
+        'onkeydown="if(event.key===\'Enter\')submitCommentReply(\''+c.id+'\',\''+postId+'\')">'+
+      '<div class="chat-mentions-list hidden" id="cmt-reply-drop-'+c.id+'" style="bottom:auto;top:100%%;z-index:100"></div>'+
+    '</div>'+
+    '<button class="post-comment-submit" onclick="submitCommentReply(\''+c.id+'\',\''+postId+'\')">'+I18N['common.send_btn']+'</button>'+
+  '</div>' : '';
+
+  const repliesHtml = replies.length
+    ? '<div id="cmt-replies-'+c.id+'">'+replies.map(r => renderCommentItem(r, postId, true)).join('')+'</div>'
+    : '<div id="cmt-replies-'+c.id+'"></div>';
+
+  return '<div class="comment-item" id="cmt-'+c.id+'" style="'+indent+'">'+
+    '<span class="comment-avatar">'+c.avatar_svg+'</span>'+
+    '<div class="comment-body" style="flex:1">'+
+      '<span class="comment-pseudo">@'+escHtml(c.pseudo)+(c.pseudo==='Yousse'?'<span class="scorbits-badge" title="Scorbits Official"><span>S</span></span>':'')+'</span>'+
+      '<span class="comment-age">'+relAge(c.created_at)+'</span>'+
+      '<div class="comment-text">'+linkify(c.content)+'</div>'+
+      '<button onclick="translateMsg(this.dataset.t,this)" data-t="'+escHtml(c.content||'').replace(/"/g,'&quot;')+'" style="background:none;border:none;color:#444;font-size:.72rem;cursor:pointer;padding:1px 4px;margin-top:2px;display:block;">'+(LANG==='fr'?'Traduire':'Translate')+'</button>'+
+      actionBtns+
+      replyBox+
+      repliesHtml+
+    '</div>'+
+    delBtn+
+  '</div>';
+}
+async function toggleCommentLike(commentId, postId) {
+  if (!IS_LOGGED_IN) { window.location='/wallet'; return; }
+  try {
+    const res = await fetch('/api/comment/like', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({comment_id: commentId})});
+    const d = await res.json();
+    const btn = document.getElementById('cmt-like-'+commentId);
+    const countEl = document.getElementById('cmt-like-count-'+commentId);
+    if (btn) btn.style.cssText = d.liked ? 'color:#00e85a;font-weight:700' : 'color:#888';
+    if (countEl) countEl.textContent = d.count;
+  } catch(e) {}
+}
+function toggleReplyBox(commentId, postId) {
+  const box = document.getElementById('cmt-reply-box-'+commentId);
+  if (!box) return;
+  const hidden = box.classList.toggle('hidden');
+  if (!hidden) {
+    const inp = document.getElementById('cmt-reply-inp-'+commentId);
+    if (inp) {
+      inp.focus();
+      setupMentionAC(inp, document.getElementById('cmt-reply-drop-'+commentId));
+    }
+  }
+}
+async function submitCommentReply(commentId, postId) {
+  const inp = document.getElementById('cmt-reply-inp-'+commentId);
+  if (!inp || !inp.value.trim()) return;
+  try {
+    await fetch('/api/comment/reply', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({comment_id: commentId, post_id: postId, content: inp.value.trim()})});
+    inp.value = '';
+    document.getElementById('cmt-reply-box-'+commentId).classList.add('hidden');
+    // Reload comments to show the new reply
+    await openCommentsModal(postId);
+  } catch(e) {}
+}
+let _currentCommentsPostId = null;
 async function openCommentsModal(postId) {
+  _currentCommentsPostId = postId;
   const modal = document.getElementById('comments-modal');
   const list = document.getElementById('comments-list');
   if(!modal||!list) return;
@@ -1074,19 +1393,7 @@ async function openCommentsModal(postId) {
     const res = await fetch('/api/posts/comments?post_id='+postId);
     const comments = await res.json() || [];
     if(!comments.length) { list.innerHTML='<div style="color:var(--muted);font-size:0.82rem;text-align:center;padding:0.8rem">'+I18N['common.no_comments']+'</div>'; return; }
-    list.innerHTML = comments.map(c => {
-      const isOwn = IS_LOGGED_IN && c.pseudo === CURRENT_PSEUDO;
-      const delBtn = isOwn ? '<button class="post-delete-btn" onclick="deleteComment(\''+c.id+'\',this)" title="Supprimer" style="margin-left:auto;align-self:flex-start">&#128465;</button>' : (IS_ADMIN ? '<button class="admin-del" onclick="adminDeleteComment(\''+c.id+'\',this)" title="Supprimer (admin)" style="margin-left:auto;align-self:flex-start">✕</button>' : '');
-      return '<div class="comment-item" id="cmt-'+c.id+'">'+
-        '<span class="comment-avatar">'+c.avatar_svg+'</span>'+
-        '<div class="comment-body" style="flex:1">'+
-          '<span class="comment-pseudo">@'+escHtml(c.pseudo)+'</span>'+
-          '<span class="comment-age">'+relAge(c.created_at)+'</span>'+
-          '<div class="comment-text">'+linkify(c.content)+'</div>'+
-        '</div>'+
-        delBtn+
-      '</div>';
-    }).join('');
+    list.innerHTML = comments.map(c => renderCommentItem(c, postId, false)).join('');
   } catch(e) { list.innerHTML='<div style="color:#ff6464;font-size:0.82rem">'+I18N['common.error']+'</div>'; }
 }
 function closeCommentsModal() {
@@ -1147,10 +1454,12 @@ function escHtml(t) {
 function linkify(text) {
   if (!text) return '';
   text = text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  return text.replace(/(https?:\/\/[^\s<>"]+|(?<![/@])\b(?:[a-zA-Z0-9-]+\.)+(?:com|net|org|io|fr|be|co|uk|ca|dev|app|xyz|info|me|tv|gg)[^\s<>"]*)/gi, function(url) {
+  text = text.replace(/(https?:\/\/[^\s<>"]+|(?<![/@])\b(?:[a-zA-Z0-9-]+\.)+(?:com|net|org|io|fr|be|co|uk|ca|dev|app|xyz|info|me|tv|gg)[^\s<>"]*)/gi, function(url) {
     const href = url.startsWith('http') ? url : 'https://' + url;
     return '<a href="' + href + '" target="_blank" rel="noopener noreferrer" style="color:#00e85a;text-decoration:underline;word-break:break-all;">' + url + '</a>';
   });
+  text = text.replace(/@(\w+)/g, '<a class="mention-link" onclick="showProfile(\'$1\')">@$1</a>');
+  return text;
 }
 console.log('linkify test:', linkify('scorbits.com'));
 
@@ -1182,28 +1491,44 @@ async function showProfile(pseudo) {
 
 function closeProfile() { document.getElementById('profile-modal').classList.add('hidden'); }
 
+// ── Traduction MyMemory ──
+async function translateMsg(text, btn) {
+  const targetLang = document.documentElement.lang === 'fr' ? 'fr' : 'en';
+  btn.textContent = '...';
+  btn.disabled = true;
+  try {
+    const url = 'https://api.mymemory.translated.net/get?q=' + encodeURIComponent(text) + '&langpair=autodetect|' + targetLang;
+    const r = await fetch(url);
+    const d = await r.json();
+    if (d.responseStatus === 200 && d.responseData && d.responseData.translatedText) {
+      const box = document.createElement('div');
+      box.style.cssText = 'font-size:.78rem;color:#888;margin-top:5px;font-style:italic;border-left:2px solid #2a2a2a;padding-left:6px;line-height:1.5;';
+      box.textContent = d.responseData.translatedText;
+      btn.parentNode.insertBefore(box, btn);
+      btn.remove();
+    } else {
+      btn.textContent = targetLang === 'fr' ? 'Traduire' : 'Translate';
+      btn.disabled = false;
+    }
+  } catch(e) {
+    btn.textContent = targetLang === 'fr' ? 'Traduire' : 'Translate';
+    btn.disabled = false;
+  }
+}
+window.translateMsg = translateMsg;
+
 // ── Bloc en cours ──
 let _bpIdx=%d,_bpTs=%d;
 function _bpUpdate(){
   const now=Math.floor(Date.now()/1000);
   const elapsed=Math.max(0,now-_bpTs);
-  const pct=Math.min(100,Math.floor(elapsed/180*100));
-  const rem=Math.max(0,180-elapsed);
-  const f=document.getElementById('bp-fill');
-  const t=document.getElementById('bp-time');
   const el=document.getElementById('bp-elapsed');
-  if(f){
-    f.style.width=pct+'%%';
-    if(elapsed>=180){f.classList.add('pulse');}else{f.classList.remove('pulse');}
-  }
   if(el){
     const em=Math.floor(elapsed/60),es=elapsed%%60;
-    el.textContent=em>0?(em+'m '+es+'s since last block'):(es+'s since last block');
-  }
-  if(t){
-    if(rem<=0)t.textContent=I18N['home.imminent'];
-    else if(rem<60)t.textContent=I18N['home.next_block_in']+'~'+rem+'s';
-    else t.textContent=I18N['home.next_block_in']+'~'+Math.floor(rem/60)+'m '+(rem%%60)+'s';
+    const timeStr=em>0?(em+'m '+es+'s'):(es+'s');
+    const label=LANG==='fr'?('Dernier bloc il y a\u00a0: '+timeStr):('Last block: '+timeStr+' ago');
+    el.textContent=label;
+    el.style.color=elapsed>600?'var(--red, #e84040)':'var(--text2)';
   }
 }
 async function _bpRefresh(){
@@ -1238,6 +1563,154 @@ async function loadActiveMiners() {
 loadActiveMiners();
 setInterval(loadActiveMiners, 60000);
 
+// ── Announcements ──
+let annEditId = null;
+let annCoverURL = '';
+async function loadAnnouncements() {
+  const res = await fetch('/api/announcements');
+  const list = await res.json() || [];
+  const el = document.getElementById('announcements-list');
+  if (!el) return;
+  if (!list.length) { el.innerHTML = '<div style="color:#5a7a9a;font-size:.85rem;padding:.5rem 0">Aucune annonce pour le moment.</div>'; return; }
+  el.innerHTML = list.map(a => {
+    const d = new Date(a.created_at);
+    const dateStr = d.toLocaleDateString(undefined, {year:'numeric',month:'short',day:'numeric'});
+    const adminBtns = IS_ADMIN ? `+"`"+`<div style="display:flex;gap:.5rem;margin-top:.75rem">
+        <button onclick="editAnn('${a.id}','${escHtml(a.title)}',${JSON.stringify(a.content)},'${a.media_url||''}')" style="background:#132035;border:1px solid #1e90ff44;border-radius:4px;padding:3px 10px;color:#7ab8e0;cursor:pointer;font-size:.78rem">Modifier</button>
+        <button onclick="deleteAnn('${a.id}')" style="background:#132035;border:1px solid #e5533344;border-radius:4px;padding:3px 10px;color:#e55;cursor:pointer;font-size:.78rem">Supprimer</button>
+      </div>`+"`"+` : '';
+    const coverImg = a.media_url ? `+"`"+`<img class="ann-cover-img" src="${a.media_url}" alt="">`+"`"+` : '';
+    return `+"`"+`<div class="ann-card">
+      <div class="ann-card-header">
+        <span class="ann-official-badge">📢 ANNONCE OFFICIELLE</span>
+        <span class="ann-card-date">${dateStr}</span>
+      </div>
+      <div class="ann-title">${escHtml(a.title)}</div>
+      <div class="ann-content">${a.content}</div>
+      ${coverImg}
+      ${adminBtns}
+    </div>`+"`"+`;
+  }).join('');
+}
+function _annResetCoverUI() {
+  annCoverURL = '';
+  const prev = document.getElementById('ann-cover-preview');
+  const name = document.getElementById('ann-cover-name');
+  const btn  = document.getElementById('ann-cover-remove');
+  const inp  = document.getElementById('ann-cover-input');
+  if (prev) prev.innerHTML = '';
+  if (name) name.textContent = '';
+  if (btn)  btn.style.display = 'none';
+  if (inp)  inp.value = '';
+}
+function openAnnModal() {
+  annEditId = null;
+  document.getElementById('ann-title').value = '';
+  document.getElementById('ann-editor').innerHTML = '';
+  document.getElementById('ann-preview').innerHTML = '';
+  _annResetCoverUI();
+  document.getElementById('ann-modal').classList.remove('hidden');
+}
+function closeAnnModal() {
+  document.getElementById('ann-modal').classList.add('hidden');
+  annEditId = null;
+}
+function editAnn(id, title, content, mediaUrl) {
+  annEditId = id;
+  annCoverURL = mediaUrl || '';
+  document.getElementById('ann-title').value = title;
+  document.getElementById('ann-editor').innerHTML = content;
+  annUpdatePreview();
+  const prev = document.getElementById('ann-cover-preview');
+  const name = document.getElementById('ann-cover-name');
+  const btn  = document.getElementById('ann-cover-remove');
+  if (annCoverURL) {
+    if (prev) prev.innerHTML = '<img src="'+annCoverURL+'" style="max-height:80px;border-radius:5px;margin-top:2px">';
+    if (name) name.textContent = 'Image jointe';
+    if (btn)  btn.style.display = 'inline';
+  } else {
+    if (prev) prev.innerHTML = '';
+    if (name) name.textContent = '';
+    if (btn)  btn.style.display = 'none';
+  }
+  document.getElementById('ann-modal').classList.remove('hidden');
+}
+function annRemoveCover() { _annResetCoverUI(); }
+async function annUploadCover(input) {
+  if (!input.files || !input.files[0]) return;
+  const fd = new FormData();
+  fd.append('image', input.files[0]);
+  const name = document.getElementById('ann-cover-name');
+  const prev = document.getElementById('ann-cover-preview');
+  const btn  = document.getElementById('ann-cover-remove');
+  if (name) name.textContent = 'Envoi en cours…';
+  try {
+    const res = await fetch('/api/announcements/upload', {method:'POST', body:fd});
+    const data = await res.json();
+    if (data.url) {
+      annCoverURL = data.url;
+      if (prev) prev.innerHTML = '<img src="'+data.url+'" style="max-height:80px;border-radius:5px;margin-top:2px">';
+      if (name) name.textContent = input.files[0].name;
+      if (btn)  btn.style.display = 'inline';
+    } else {
+      if (name) name.textContent = 'Erreur upload';
+    }
+  } catch(e) { if (name) name.textContent = 'Erreur réseau'; }
+  input.value = '';
+}
+function annCmd(cmd) {
+  document.getElementById('ann-editor').focus();
+  document.execCommand(cmd, false, null);
+  annUpdatePreview();
+}
+function annInsertLink() {
+  const url = prompt('Enter URL:');
+  if (!url) return;
+  document.getElementById('ann-editor').focus();
+  document.execCommand('createLink', false, url);
+  annUpdatePreview();
+}
+async function annUploadImg(input) {
+  if (!input.files || !input.files[0]) return;
+  const fd = new FormData();
+  fd.append('image', input.files[0]);
+  try {
+    const res = await fetch('/api/announcements/upload', {method:'POST', body:fd});
+    const data = await res.json();
+    if (data.url) {
+      document.getElementById('ann-editor').focus();
+      document.execCommand('insertImage', false, data.url);
+      annUpdatePreview();
+    } else {
+      alert('Upload failed');
+    }
+  } catch(e) { alert('Upload error'); }
+  input.value = '';
+}
+function annUpdatePreview() {
+  const html = document.getElementById('ann-editor').innerHTML;
+  document.getElementById('ann-preview').innerHTML = html;
+}
+async function submitAnn() {
+  const title = document.getElementById('ann-title').value.trim();
+  const content = document.getElementById('ann-editor').innerHTML.trim();
+  if (!title || !content || content === '<br>') { alert('Title and content required'); return; }
+  const url = annEditId ? `+"`"+`/api/announcements/${annEditId}`+"`"+` : '/api/announcements';
+  const method = annEditId ? 'PUT' : 'POST';
+  await fetch(url, {method, headers:{'Content-Type':'application/json'}, body:JSON.stringify({title, content, media_url: annCoverURL})});
+  closeAnnModal();
+  loadAnnouncements();
+}
+async function deleteAnn(id) {
+  if (!confirm('Delete this announcement?')) return;
+  await fetch(`+"`"+`/api/announcements/${id}`+"`"+`, {method:'DELETE'});
+  loadAnnouncements();
+}
+loadAnnouncements();
+window.openAnnModal=openAnnModal; window.closeAnnModal=closeAnnModal; window.editAnn=editAnn; window.submitAnn=submitAnn; window.deleteAnn=deleteAnn;
+window.annCmd=annCmd; window.annInsertLink=annInsertLink; window.annUploadImg=annUploadImg; window.annUpdatePreview=annUpdatePreview;
+window.annUploadCover=annUploadCover; window.annRemoveCover=annRemoveCover;
+
 // ── Expose all chat onclick functions to global scope ──
 window.sendChatMsg        = sendChatMsg;
 window.toggleEmojiPicker  = toggleEmojiPicker;
@@ -1259,14 +1732,17 @@ window.escHtml            = escHtml;
 window.showProfile        = showProfile;
 window.reactPost          = reactPost;
 window.deletePost         = deletePost;
-window.deleteComment      = deleteComment;
-window.adminDeletePost    = adminDeletePost;
-window.adminDeleteComment = adminDeleteComment;
-window.adminDeleteChatMsg = adminDeleteChatMsg;
-window.toggleCommentBox   = toggleCommentBox;
-window.submitComment      = submitComment;
-window.openCommentsModal  = openCommentsModal;
-window.closeCommentsModal = closeCommentsModal;
+window.deleteComment        = deleteComment;
+window.adminDeletePost      = adminDeletePost;
+window.adminDeleteComment   = adminDeleteComment;
+window.adminDeleteChatMsg   = adminDeleteChatMsg;
+window.toggleCommentBox     = toggleCommentBox;
+window.submitComment        = submitComment;
+window.openCommentsModal    = openCommentsModal;
+window.closeCommentsModal   = closeCommentsModal;
+window.toggleCommentLike    = toggleCommentLike;
+window.toggleReplyBox       = toggleReplyBox;
+window.submitCommentReply   = submitCommentReply;
 window.renderSharedPost   = renderSharedPost;
 window.sharePostToChat    = sharePostToChat;
 window.cancelSharePost    = cancelSharePost;
@@ -1444,14 +1920,16 @@ func (e *Explorer) handleSearch(w http.ResponseWriter, r *http.Request) {
 // ─── ACTIVE MINERS ────────────────────────────────────────────────────────────
 
 func (e *Explorer) getActiveMiners() int {
-	cutoff := time.Now().Unix() - 3600
-	seen := make(map[string]struct{})
-	for _, b := range e.bc.Blocks {
-		if b.Timestamp >= cutoff && b.MinerAddress != "" {
-			seen[b.MinerAddress] = struct{}{}
+	cutoff := time.Now().Unix() - 300
+	e.activeMinersMu.Lock()
+	defer e.activeMinersMu.Unlock()
+	count := 0
+	for _, ts := range e.activeMiners {
+		if ts >= cutoff {
+			count++
 		}
 	}
-	return len(seen)
+	return count
 }
 
 func (e *Explorer) apiActiveMiners(w http.ResponseWriter, r *http.Request) {
@@ -1468,6 +1946,7 @@ func (e *Explorer) apiStats(w http.ResponseWriter, r *http.Request) {
 		"blocks": len(e.bc.Blocks), "total_supply": e.bc.TotalSupply,
 		"max_supply": blockchain.MaxSupply, "difficulty": e.bc.Difficulty,
 		"last_block": last.Index, "last_block_timestamp": last.Timestamp, "valid": e.bc.IsValid(),
+		"active_miners": e.getActiveMiners(),
 	})
 }
 
@@ -1567,6 +2046,54 @@ func (e *Explorer) apiHistory(w http.ResponseWriter, r *http.Request) {
 
 var wsUpgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
+func (e *Explorer) apiTransactions(w http.ResponseWriter, r *http.Request) {
+	type TxEntry struct {
+		Block     int    `json:"block"`
+		From      string `json:"from"`
+		To        string `json:"to"`
+		Amount    int    `json:"amount"`
+		Fee       int    `json:"fee"`
+		Timestamp int64  `json:"timestamp"`
+		Hash      string `json:"hash"`
+	}
+	var entries []TxEntry
+	for _, b := range e.bc.Blocks {
+		for _, tx := range b.Transactions {
+			if !strings.Contains(tx, "->") {
+				continue
+			}
+			parts := strings.SplitN(tx, "->", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			from := parts[0]
+			rest := strings.SplitN(parts[1], ":", 3)
+			if len(rest) < 2 {
+				continue
+			}
+			to := rest[0]
+			amountStr := strings.TrimSuffix(rest[1], "SCO")
+			amount, _ := strconv.Atoi(amountStr)
+			fee := 0
+			if len(rest) > 2 && strings.HasPrefix(rest[2], "fee") {
+				feeStr := strings.TrimPrefix(rest[2], "fee")
+				feeStr = strings.Split(feeStr, ":")[0]
+				fee, _ = strconv.Atoi(feeStr)
+			}
+			entries = append(entries, TxEntry{
+				Block: b.Index, From: from, To: to,
+				Amount: amount, Fee: fee,
+				Timestamp: b.Timestamp, Hash: b.Hash,
+			})
+		}
+	}
+	for i, j := 0, len(entries)-1; i < j; i, j = i+1, j-1 {
+		entries[i], entries[j] = entries[j], entries[i]
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(entries)
 }
 
 func (e *Explorer) wsChat(w http.ResponseWriter, r *http.Request) {
@@ -1688,8 +2215,8 @@ func (e *Explorer) apiChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	content := stripHTML(req.Content)
-	if len([]rune(content)) > 500 {
-		content = string([]rune(content)[:500])
+	if len([]rune(content)) > 5000 {
+		content = string([]rune(content)[:5000])
 	}
 	if content == "" && req.GifURL == "" && req.SharedPostID == "" {
 		http.Error(w, `{"error":"empty"}`, 400)
@@ -1729,6 +2256,9 @@ func (e *Explorer) apiChat(w http.ResponseWriter, r *http.Request) {
 	if err := db.SaveChatMessage(msg); err != nil {
 		http.Error(w, `{"error":"db error"}`, 500)
 		return
+	}
+	if mentions := extractMentions(content); len(mentions) > 0 {
+		go sendMentionNotifs(user, mentions, bson.NilObjectID, content)
 	}
 	e.chatHub.BroadcastMessage(map[string]interface{}{"type": "message", "data": msg})
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
@@ -2023,7 +2553,11 @@ func (e *Explorer) apiPosts(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		if len([]rune(content)) > 500 {
+		maxLen := 500
+		if user.Pseudo == "Yousse" {
+			maxLen = 5000
+		}
+		if len([]rune(content)) > maxLen {
 			http.Error(w, `{"error":"trop long"}`, 400)
 			return
 		}
@@ -2064,6 +2598,9 @@ func (e *Explorer) apiPosts(w http.ResponseWriter, r *http.Request) {
 		if err := db.CreatePost(p); err != nil {
 			http.Error(w, `{"error":"erreur serveur"}`, 500)
 			return
+		}
+		if mentions := extractMentions(content); len(mentions) > 0 {
+			go sendMentionNotifs(user, mentions, p.ID, content)
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "post": p})
 		return
@@ -2179,6 +2716,9 @@ func (e *Explorer) apiPostsComments(w http.ResponseWriter, r *http.Request) {
 		if err := db.AddComment(c); err != nil {
 			http.Error(w, `{"error":"erreur serveur"}`, 500)
 			return
+		}
+		if mentions := extractMentions(req.Content); len(mentions) > 0 {
+			go sendMentionNotifs(user, mentions, postID, req.Content)
 		}
 		// Notify post owner asynchronously (skip if commenter == owner)
 		go func(commenterUser *db.User, pid bson.ObjectID, content string) {
@@ -2361,6 +2901,31 @@ func (e *Explorer) apiNotificationsReadOne(w http.ResponseWriter, r *http.Reques
 	}
 	db.MarkNotificationRead(notifID, user.ID)
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+func (e *Explorer) apiNotificationsPoll(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	user, err := auth.GetSession(r)
+	if err != nil || user == nil {
+		http.Error(w, `{"error":"non connecté"}`, 401)
+		return
+	}
+	sinceStr := r.URL.Query().Get("since")
+	var since time.Time
+	if sinceStr != "" {
+		if ts, err := strconv.ParseInt(sinceStr, 10, 64); err == nil {
+			since = time.Unix(ts, 0)
+		}
+	}
+	if since.IsZero() {
+		since = time.Now().Add(-10 * time.Second)
+	}
+	notifs, err := db.GetNotificationsSince(user.ID, since)
+	if err != nil || notifs == nil {
+		json.NewEncoder(w).Encode([]interface{}{})
+		return
+	}
+	json.NewEncoder(w).Encode(notifs)
 }
 
 func (e *Explorer) apiLeaderboard(w http.ResponseWriter, r *http.Request) {
@@ -2862,10 +3427,6 @@ func (e *Explorer) apiMineJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	last := e.bc.GetLastBlock()
-	nextDiff := e.bc.Difficulty
-	if (len(e.bc.Blocks)-1)%blockchain.DifficultyInterval == 0 {
-		nextDiff = e.bc.AdjustDifficulty()
-	}
 	pending := e.mp.GetPending(50)
 	txStrings := make([]string, 0, len(pending))
 	for _, tx := range pending {
@@ -2877,7 +3438,7 @@ func (e *Explorer) apiMineJob(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"last_index":    last.Index,
 		"last_hash":     last.Hash,
-		"difficulty":    nextDiff,
+		"difficulty":    e.bc.Difficulty,
 		"reward":        blockchain.CalculateReward(last.Index + 1),
 		"miner_address": user.Address,
 		"transactions":  txStrings,
@@ -2888,10 +3449,6 @@ func (e *Explorer) apiMineSubmit(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
 		last := e.bc.GetLastBlock()
 		// Calcul de la vraie difficulté du prochain bloc (même logique que AddBlock)
-		nextDiff := e.bc.Difficulty
-		if (len(e.bc.Blocks)-1)%blockchain.DifficultyInterval == 0 {
-			nextDiff = e.bc.AdjustDifficulty()
-		}
 		// Inclure les transactions en attente dans le job
 		pending := e.mp.GetPending(50)
 		txStrings := make([]string, 0, len(pending))
@@ -2904,7 +3461,7 @@ func (e *Explorer) apiMineSubmit(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"last_hash": last.Hash, "last_index": last.Index,
-			"difficulty": nextDiff, "reward": blockchain.CalculateReward(last.Index + 1),
+			"difficulty": e.bc.Difficulty, "reward": blockchain.CalculateReward(last.Index + 1),
 			"transactions": txStrings,
 		})
 		return
@@ -2936,9 +3493,9 @@ func (e *Explorer) apiMineSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validation timestamp : doit être dans les 10 dernières minutes et pas dans le futur
+	// Validation timestamp : fenêtre ±120s autour du temps serveur
 	now := time.Now().Unix()
-	if req.Timestamp < now-600 || req.Timestamp > now+60 {
+	if req.Timestamp < now-120 || req.Timestamp > now+120 {
 		jsonError(w, "Timestamp invalide", 400)
 		return
 	}
@@ -2962,8 +3519,8 @@ func (e *Explorer) apiMineSubmit(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "Timestamp antérieur ou égal au bloc précédent", 400)
 		return
 	}
-	// Anti-spike : intervalle minimum de 10 secondes entre deux blocs
-	if req.Timestamp-last.Timestamp < 10 {
+	// Anti-spike basé sur le temps réel du serveur, pas le timestamp du mineur
+	if time.Now().Unix()-atomic.LoadInt64(&e.lastBlockAcceptedAt) < 120 {
 		e.mineMu.Unlock()
 		jsonError(w, "Bloc trop rapide", 400)
 		return
@@ -2995,12 +3552,7 @@ func (e *Explorer) apiMineSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Difficulté serveur — jamais celle fournie par le client
-	serverDiff := e.bc.Difficulty
-	if (len(e.bc.Blocks)-1)%blockchain.DifficultyInterval == 0 {
-		serverDiff = e.bc.AdjustDifficulty()
-	}
-	target := strings.Repeat("0", serverDiff)
+	target := strings.Repeat("0", e.bc.Difficulty)
 	if !strings.HasPrefix(expectedHash, target) {
 		jsonError(w, "Difficulté non atteinte", 400)
 		return
@@ -3031,14 +3583,14 @@ func (e *Explorer) apiMineSubmit(w http.ResponseWriter, r *http.Request) {
 		PreviousHash: req.PreviousHash,
 		Hash:         req.Hash,
 		Nonce:        req.Nonce,
-		Difficulty:   serverDiff,
+		Difficulty:   e.bc.Difficulty,
 		Reward:       blockchain.CalculateReward(req.Index),
 		MinerAddress: req.MinerAddress,
 	}
 	e.bc.Blocks = append(e.bc.Blocks, newBlock)
 	e.bc.TotalSupply += newBlock.Reward
-	e.bc.Difficulty = serverDiff
 	e.bc.Save()
+	atomic.StoreInt64(&e.lastBlockAcceptedAt, time.Now().Unix())
 
 	// Vider les transactions confirmées de la mempool
 	e.mp.ClearByStrings(req.Transactions)
@@ -3056,6 +3608,59 @@ func jsonError(w http.ResponseWriter, msg string, code int) {
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
+// extractMentions retourne la liste dédupliquée des @usernames trouvés dans text.
+func extractMentions(text string) []string {
+	seen := make(map[string]bool)
+	var result []string
+	i := 0
+	for i < len(text) {
+		if text[i] == '@' {
+			j := i + 1
+			for j < len(text) && (text[j] == '_' || (text[j] >= 'a' && text[j] <= 'z') || (text[j] >= 'A' && text[j] <= 'Z') || (text[j] >= '0' && text[j] <= '9')) {
+				j++
+			}
+			if j > i+1 {
+				name := text[i+1 : j]
+				if !seen[name] {
+					seen[name] = true
+					result = append(result, name)
+				}
+			}
+			i = j
+		} else {
+			i++
+		}
+	}
+	return result
+}
+
+// sendMentionNotifs envoie une notification à chaque utilisateur mentionné.
+// ctx = "post" | "comment" | "chat". Exécuté en goroutine.
+func sendMentionNotifs(mentioner *db.User, mentions []string, postID bson.ObjectID, preview string) {
+	if len(preview) > 80 {
+		preview = string([]rune(preview)[:80])
+	}
+	avatar := renderProfilePic(mentioner, 28)
+	for _, username := range mentions {
+		if strings.EqualFold(username, mentioner.Pseudo) {
+			continue // pas de self-notif
+		}
+		target, err := db.GetUserByPseudo(username)
+		if err != nil || target == nil {
+			continue
+		}
+		db.CreateNotification(&db.Notification{
+			UserID:         target.ID,
+			FromID:         mentioner.ID,
+			FromPseudo:     mentioner.Pseudo,
+			FromAvatarSVG:  avatar,
+			PostID:         postID,
+			CommentPreview: "@mention : " + preview,
+			Read:           false,
+		})
+	}
+}
+
 // ─── EXTERNAL MINER API ───────────────────────────────────────────────────────
 
 // GET /mining/work — retourne le travail de minage pour le mineur externe (sans auth)
@@ -3067,11 +3672,20 @@ func (e *Explorer) apiMiningWork(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	last := e.bc.GetLastBlock()
-	nextDiff := e.bc.Difficulty
-	if (len(e.bc.Blocks)-1)%blockchain.DifficultyInterval == 0 {
-		nextDiff = e.bc.AdjustDifficulty()
+	// Enregistre le mineur actif (par adresse si fournie, sinon par IP)
+	minerKey := r.URL.Query().Get("address")
+	if minerKey == "" {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			host = r.RemoteAddr
+		}
+		minerKey = host
 	}
+	e.activeMinersMu.Lock()
+	e.activeMiners[minerKey] = time.Now().Unix()
+	e.activeMinersMu.Unlock()
+
+	last := e.bc.GetLastBlock()
 	pending := e.mp.GetPending(50)
 	txStrings := make([]string, 0, len(pending))
 	for _, tx := range pending {
@@ -3083,7 +3697,7 @@ func (e *Explorer) apiMiningWork(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"block_index":    last.Index + 1,
 		"previous_hash":  last.Hash,
-		"difficulty":     nextDiff,
+		"difficulty":     e.bc.Difficulty,
 		"reward":         blockchain.CalculateReward(last.Index + 1),
 		"timestamp":      time.Now().Unix(),
 		"last_timestamp": last.Timestamp,
@@ -3112,6 +3726,7 @@ func (e *Explorer) apiMiningSubmit(w http.ResponseWriter, r *http.Request) {
 		MinerAddress string   `json:"miner_address"`
 		Timestamp    int64    `json:"timestamp"`
 		Transactions []string `json:"transactions"`
+		Difficulty   int      `json:"difficulty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, "JSON invalide", 400)
@@ -3122,9 +3737,9 @@ func (e *Explorer) apiMiningSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validation timestamp
+	// Validation timestamp : fenêtre ±120s autour du temps serveur
 	now := time.Now().Unix()
-	if req.Timestamp < now-600 || req.Timestamp > now+60 {
+	if req.Timestamp < now-120 || req.Timestamp > now+120 {
 		jsonError(w, "Timestamp invalide", 400)
 		return
 	}
@@ -3141,9 +3756,24 @@ func (e *Explorer) apiMiningSubmit(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "Timestamp antérieur ou égal au bloc précédent", 400)
 		return
 	}
-	// Anti-spike : minimum 10 secondes entre deux blocs
-	if req.Timestamp-last.Timestamp < 10 {
+	// Anti-spike basé sur le temps réel du serveur, pas le timestamp du mineur
+	if time.Now().Unix()-atomic.LoadInt64(&e.lastBlockAcceptedAt) < 120 {
 		jsonError(w, "Bloc trop rapide (anti-spike)", 400)
+		return
+	}
+	// Cooldown par adresse : 2 minutes entre chaque bloc accepté
+	e.minerMu.Lock()
+	lastSubmit, exists := e.minerLastSubmit[req.MinerAddress]
+	if exists && time.Now().Unix()-lastSubmit < 120 {
+		e.minerMu.Unlock()
+		jsonError(w, "Cooldown : attendez 2 minutes entre chaque bloc", 400)
+		return
+	}
+	e.minerMu.Unlock()
+	// Anti-consecutive : refuser si ce mineur a déjà trouvé les 2 derniers blocs
+	if e.bc.IsConsecutiveMiner(req.MinerAddress) {
+		fmt.Printf("[Anti-consecutive] Bloc refusé pour %s — 2 blocs consécutifs atteints\n", req.MinerAddress)
+		jsonError(w, "Consecutive block limit reached — wait for another miner", 400)
 		return
 	}
 	// Recalcul SHA256 — format identique à blockchain/block.go CalculateHash()
@@ -3162,11 +3792,7 @@ func (e *Explorer) apiMiningSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	serverDiff := e.bc.Difficulty
-	if (len(e.bc.Blocks)-1)%blockchain.DifficultyInterval == 0 {
-		serverDiff = e.bc.AdjustDifficulty()
-	}
-	if !strings.HasPrefix(req.Hash, strings.Repeat("0", serverDiff)) {
+	if !strings.HasPrefix(req.Hash, strings.Repeat("0", e.bc.Difficulty)) {
 		jsonError(w, "Difficulté non atteinte", 400)
 		return
 	}
@@ -3181,14 +3807,36 @@ func (e *Explorer) apiMiningSubmit(w http.ResponseWriter, r *http.Request) {
 		PreviousHash: last.Hash,
 		Hash:         req.Hash,
 		Nonce:        req.Nonce,
-		Difficulty:   serverDiff,
+		Difficulty:   e.bc.Difficulty,
 		Reward:       blockchain.CalculateReward(req.BlockIndex),
 		MinerAddress: req.MinerAddress,
 	}
+	newBlock.AcceptedAt = time.Now().Unix()
 	e.bc.Blocks = append(e.bc.Blocks, newBlock)
 	e.bc.TotalSupply += newBlock.Reward
-	e.bc.Difficulty = serverDiff
+
+	// Ajustement de difficulté basé sur le temps réel serveur (AcceptedAt, pas Timestamp mineur)
+	if !e.bc.DifficultyForced && (len(e.bc.Blocks)-1)%blockchain.DifficultyInterval == 0 {
+		firstBlock := e.bc.Blocks[len(e.bc.Blocks)-blockchain.DifficultyInterval]
+		elapsed := time.Now().Unix() - firstBlock.AcceptedAt
+		target := int64(120 * blockchain.DifficultyInterval)
+		if elapsed < target {
+			e.bc.Difficulty += 1
+			if e.bc.Difficulty > blockchain.MaxDifficulty {
+				e.bc.Difficulty = blockchain.MaxDifficulty
+			}
+		} else {
+			e.bc.Difficulty -= 1
+			if e.bc.Difficulty < blockchain.MinDifficulty {
+				e.bc.Difficulty = blockchain.MinDifficulty
+			}
+		}
+	}
 	e.bc.Save()
+	atomic.StoreInt64(&e.lastBlockAcceptedAt, time.Now().Unix())
+	e.minerMu.Lock()
+	e.minerLastSubmit[req.MinerAddress] = time.Now().Unix()
+	e.minerMu.Unlock()
 	e.mp.ClearByStrings(txStrings)
 
 	if e.node != nil {
@@ -3303,6 +3951,102 @@ func (e *Explorer) apiAdminCommentDelete(w http.ResponseWriter, r *http.Request)
 	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
 }
 
+// POST /api/comment/like — toggle like sur un commentaire
+func (e *Explorer) apiCommentLike(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		jsonError(w, "POST requis", 405)
+		return
+	}
+	user, err := auth.GetSession(r)
+	if err != nil || user == nil {
+		jsonError(w, "Non connecté", 401)
+		return
+	}
+	var req struct {
+		CommentID string `json:"comment_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "JSON invalide", 400)
+		return
+	}
+	commentID, err := bson.ObjectIDFromHex(req.CommentID)
+	if err != nil {
+		jsonError(w, "ID invalide", 400)
+		return
+	}
+	liked, count, err := db.ToggleCommentLike(commentID, user.ID.Hex())
+	if err != nil {
+		jsonError(w, "Erreur serveur", 500)
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"liked": liked, "count": count})
+}
+
+// POST /api/comment/reply — ajouter une réponse à un commentaire
+func (e *Explorer) apiCommentReply(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		jsonError(w, "POST requis", 405)
+		return
+	}
+	user, err := auth.GetSession(r)
+	if err != nil || user == nil {
+		jsonError(w, "Non connecté", 401)
+		return
+	}
+	var req struct {
+		CommentID string `json:"comment_id"`
+		PostID    string `json:"post_id"`
+		Content   string `json:"content"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Content == "" {
+		jsonError(w, "Contenu invalide", 400)
+		return
+	}
+	if len([]rune(req.Content)) > 500 {
+		jsonError(w, "Réponse trop longue (max 500)", 400)
+		return
+	}
+	commentID, err := bson.ObjectIDFromHex(req.CommentID)
+	if err != nil {
+		jsonError(w, "ID invalide", 400)
+		return
+	}
+	reply := db.CommentReply{
+		UserID:    user.ID,
+		Pseudo:    user.Pseudo,
+		AvatarSVG: renderProfilePic(user, 24),
+		Content:   req.Content,
+	}
+	if err := db.AddCommentReply(commentID, reply); err != nil {
+		jsonError(w, "Erreur serveur", 500)
+		return
+	}
+	// Notifier l'auteur du commentaire parent (hors goroutine)
+	go func() {
+		parent, err := db.GetCommentByID(commentID)
+		if err != nil || parent.UserID == user.ID {
+			return
+		}
+		postID, _ := bson.ObjectIDFromHex(req.PostID)
+		preview := req.Content
+		if len([]rune(preview)) > 80 {
+			preview = string([]rune(preview)[:80])
+		}
+		db.CreateNotification(&db.Notification{
+			UserID:         parent.UserID,
+			FromID:         user.ID,
+			FromPseudo:     user.Pseudo,
+			FromAvatarSVG:  renderProfilePic(user, 28),
+			PostID:         postID,
+			CommentPreview: "↩ " + preview,
+			Read:           false,
+		})
+	}()
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
+}
+
 func (e *Explorer) apiAdminChatDelete(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if r.Method != "POST" {
@@ -3327,6 +4071,410 @@ func (e *Explorer) apiAdminChatDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	db.AdminDeleteChatMessage(msgID)
+	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
+}
+
+// ─── CHAT IMAGE UPLOAD ────────────────────────────────────────────────────────
+
+// POST /api/chat/upload-image — upload image dans le chat global (utilisateur connecté)
+func (e *Explorer) apiChatUploadImage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		jsonError(w, "POST requis", 405)
+		return
+	}
+	if _, err := auth.GetSession(r); err != nil {
+		jsonError(w, "Non autorisé", 403)
+		return
+	}
+	if err := r.ParseMultipartForm(5 << 20); err != nil {
+		jsonError(w, "Fichier trop grand (max 5MB)", 400)
+		return
+	}
+	file, hdr, err := r.FormFile("image")
+	if err != nil {
+		jsonError(w, "Fichier manquant", 400)
+		return
+	}
+	defer file.Close()
+	ext := ".jpg"
+	if hdr.Filename != "" {
+		lower := strings.ToLower(hdr.Filename)
+		if strings.HasSuffix(lower, ".png") {
+			ext = ".png"
+		} else if strings.HasSuffix(lower, ".gif") {
+			ext = ".gif"
+		}
+	}
+	fname := fmt.Sprintf("./static/uploads/chat/%s%s", bson.NewObjectID().Hex(), ext)
+	data, err := io.ReadAll(file)
+	if err != nil {
+		jsonError(w, "Erreur lecture", 500)
+		return
+	}
+	if err := os.WriteFile(fname, data, 0644); err != nil {
+		jsonError(w, "Erreur écriture", 500)
+		return
+	}
+	url := "/static/uploads/chat/" + fname[len("./static/uploads/chat/"):]
+	json.NewEncoder(w).Encode(map[string]string{"url": url})
+}
+
+// ─── ANNOUNCEMENTS API ────────────────────────────────────────────────────────
+
+// POST /api/announcements/upload — upload image pour une annonce (admin)
+func (e *Explorer) apiAnnouncementUpload(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		jsonError(w, "POST requis", 405)
+		return
+	}
+	user, err := auth.GetSession(r)
+	if err != nil || !adminUsernames[user.Pseudo] {
+		jsonError(w, "Non autorisé", 403)
+		return
+	}
+	if err := r.ParseMultipartForm(5 << 20); err != nil {
+		jsonError(w, "Fichier trop grand (max 5MB)", 400)
+		return
+	}
+	file, hdr, err := r.FormFile("image")
+	if err != nil {
+		jsonError(w, "Fichier manquant", 400)
+		return
+	}
+	defer file.Close()
+	ext := ".jpg"
+	if hdr.Filename != "" {
+		if e := hdr.Filename[len(hdr.Filename)-4:]; e == ".png" || e == ".gif" {
+			ext = e
+		} else if len(hdr.Filename) > 5 && hdr.Filename[len(hdr.Filename)-5:] == ".jpeg" {
+			ext = ".jpg"
+		}
+	}
+	fname := fmt.Sprintf("./static/uploads/announcements/%s%s", bson.NewObjectID().Hex(), ext)
+	data, err := io.ReadAll(file)
+	if err != nil {
+		jsonError(w, "Erreur lecture", 500)
+		return
+	}
+	if err := os.WriteFile(fname, data, 0644); err != nil {
+		jsonError(w, "Erreur écriture", 500)
+		return
+	}
+	url := "/static/uploads/announcements/" + fname[len("./static/uploads/announcements/"):]
+	json.NewEncoder(w).Encode(map[string]string{"url": url})
+}
+
+// GET /api/announcements → liste | POST /api/announcements → créer (admin)
+func (e *Explorer) apiAnnouncements(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	switch r.Method {
+	case http.MethodGet:
+		list, err := db.GetAnnouncements()
+		if err != nil {
+			jsonError(w, "Erreur lecture", 500)
+			return
+		}
+		if list == nil {
+			list = []*db.Announcement{}
+		}
+		json.NewEncoder(w).Encode(list)
+	case http.MethodPost:
+		user, err := auth.GetSession(r)
+		if err != nil || !adminUsernames[user.Pseudo] {
+			jsonError(w, "Non autorisé", 403)
+			return
+		}
+		var req struct {
+			Title    string `json:"title"`
+			Content  string `json:"content"`
+			MediaURL string `json:"media_url"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Title) == "" || strings.TrimSpace(req.Content) == "" {
+			jsonError(w, "Titre et contenu requis", 400)
+			return
+		}
+		a := &db.Announcement{Title: strings.TrimSpace(req.Title), Content: strings.TrimSpace(req.Content), MediaURL: strings.TrimSpace(req.MediaURL)}
+		if err := db.CreateAnnouncement(a); err != nil {
+			jsonError(w, "Erreur création", 500)
+			return
+		}
+		w.WriteHeader(201)
+		json.NewEncoder(w).Encode(a)
+	default:
+		http.Error(w, "Méthode non supportée", 405)
+	}
+}
+
+// PUT /api/announcements/:id → modifier (admin) | DELETE → supprimer (admin)
+func (e *Explorer) apiAnnouncementByID(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	idStr := strings.TrimPrefix(r.URL.Path, "/api/announcements/")
+	id, err := bson.ObjectIDFromHex(idStr)
+	if err != nil {
+		jsonError(w, "ID invalide", 400)
+		return
+	}
+	user, err := auth.GetSession(r)
+	if err != nil || !adminUsernames[user.Pseudo] {
+		jsonError(w, "Non autorisé", 403)
+		return
+	}
+	switch r.Method {
+	case http.MethodPut:
+		var req struct {
+			Title    string `json:"title"`
+			Content  string `json:"content"`
+			MediaURL string `json:"media_url"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Title) == "" {
+			jsonError(w, "Titre requis", 400)
+			return
+		}
+		if err := db.UpdateAnnouncement(id, strings.TrimSpace(req.Title), strings.TrimSpace(req.Content), strings.TrimSpace(req.MediaURL)); err != nil {
+			jsonError(w, "Erreur mise à jour", 500)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+	case http.MethodDelete:
+		if err := db.DeleteAnnouncement(id); err != nil {
+			jsonError(w, "Erreur suppression", 500)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+	default:
+		http.Error(w, "Méthode non supportée", 405)
+	}
+}
+
+// ─── POOL API ─────────────────────────────────────────────────────────────────
+
+// GET /api/block-template — job de minage pour un pool externe
+func (e *Explorer) apiBlockTemplate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET requis", 405)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	last := e.bc.GetLastBlock()
+	pending := e.mp.GetPending(50)
+	txStrings := make([]string, 0, len(pending))
+	for _, tx := range pending {
+		txStrings = append(txStrings, tx.ToString())
+	}
+	if len(txStrings) == 0 {
+		txStrings = []string{"empty-block"}
+	}
+	txJSON, _ := json.Marshal(txStrings)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"index":        last.Index + 1,
+		"previousHash": last.Hash,
+		"transactions": string(txJSON),
+		"difficulty":   e.bc.Difficulty,
+		"blockReward":  11.0,
+	})
+}
+
+// POST /api/submit-block — soumission de bloc par un pool externe
+func (e *Explorer) apiSubmitBlock(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST requis", 405)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	var req struct {
+		Index        int      `json:"index"`
+		PreviousHash string   `json:"previousHash"`
+		Transactions []string `json:"transactions"`
+		Timestamp    int64    `json:"timestamp"`
+		Nonce        int      `json:"nonce"`
+		Hash         string   `json:"hash"`
+		Difficulty   int      `json:"difficulty"`
+		MinerAddress string   `json:"minerAddress"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "JSON invalide", 400)
+		return
+	}
+	if req.MinerAddress == "" || !strings.HasPrefix(req.MinerAddress, "SCO") {
+		jsonError(w, "Adresse mineur invalide", 400)
+		return
+	}
+
+	// Anti-spike timestamp ±120s
+	now := time.Now().Unix()
+	if req.Timestamp < now-120 || req.Timestamp > now+120 {
+		jsonError(w, "Timestamp invalide", 400)
+		return
+	}
+
+	// Recalcul du hash côté serveur
+	txStrings := req.Transactions
+	if len(txStrings) == 0 {
+		txStrings = []string{"empty-block"}
+	}
+	txData := strings.Join(txStrings, ";")
+	inp := fmt.Sprintf("%d%d%s%s%d%s", req.Index, req.Timestamp, txData, req.PreviousHash, req.Nonce, req.MinerAddress)
+	hh := sha256.Sum256([]byte(inp))
+	expectedHash := hex.EncodeToString(hh[:])
+	if expectedHash != req.Hash {
+		jsonError(w, "Hash invalide", 400)
+		return
+	}
+
+	e.mineMu.Lock()
+	defer e.mineMu.Unlock()
+
+	last := e.bc.GetLastBlock()
+	if req.Index != last.Index+1 {
+		jsonError(w, "Index invalide — bloc déjà trouvé", 409)
+		return
+	}
+	if req.PreviousHash != last.Hash {
+		jsonError(w, "PreviousHash invalide", 400)
+		return
+	}
+	if req.Timestamp <= last.Timestamp {
+		jsonError(w, "Timestamp antérieur ou égal au bloc précédent", 400)
+		return
+	}
+	// Anti-spike global (temps réel serveur depuis le dernier bloc accepté)
+	if time.Now().Unix()-atomic.LoadInt64(&e.lastBlockAcceptedAt) < 120 {
+		jsonError(w, "Bloc trop rapide (anti-spike)", 400)
+		return
+	}
+	// Vérification difficulté
+	if req.Difficulty < e.bc.Difficulty {
+		jsonError(w, "Difficulté insuffisante", 400)
+		return
+	}
+	if !strings.HasPrefix(req.Hash, strings.Repeat("0", req.Difficulty)) {
+		jsonError(w, "Difficulté non atteinte", 400)
+		return
+	}
+
+	newBlock := &blockchain.Block{
+		Index:        req.Index,
+		Timestamp:    req.Timestamp,
+		Transactions: txStrings,
+		PreviousHash: req.PreviousHash,
+		Hash:         req.Hash,
+		Nonce:        req.Nonce,
+		Difficulty:   req.Difficulty,
+		Reward:       blockchain.CalculateReward(req.Index),
+		MinerAddress: req.MinerAddress,
+	}
+	e.bc.Blocks = append(e.bc.Blocks, newBlock)
+	e.bc.TotalSupply += newBlock.Reward
+	e.bc.Save()
+	atomic.StoreInt64(&e.lastBlockAcceptedAt, time.Now().Unix())
+	e.mp.ClearByStrings(txStrings)
+
+	if e.node != nil {
+		go e.node.BroadcastBlock(newBlock)
+	}
+
+	fmt.Printf("[Pool] Bloc #%d soumis par %.16s\n", newBlock.Index, req.MinerAddress)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true, "block_index": newBlock.Index, "reward": newBlock.Reward, "hash": newBlock.Hash,
+	})
+}
+
+// POST /api/pool-payout — paiement pool vers une adresse (nécessite POOL_SECRET)
+func (e *Explorer) apiPoolPayout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST requis", 405)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+
+	var req struct {
+		To     string `json:"to"`
+		Amount int    `json:"amount"`
+		Secret string `json:"secret"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "JSON invalide", 400)
+		return
+	}
+	poolSecret := os.Getenv("POOL_SECRET")
+	if poolSecret == "" || req.Secret != poolSecret {
+		jsonError(w, "Secret invalide", 403)
+		return
+	}
+	if req.To == "" || !strings.HasPrefix(req.To, "SCO") {
+		jsonError(w, "Adresse destinataire invalide", 400)
+		return
+	}
+	if req.Amount <= 0 {
+		jsonError(w, "Montant invalide", 400)
+		return
+	}
+	poolAddress := os.Getenv("POOL_ADDRESS")
+	if poolAddress == "" {
+		jsonError(w, "POOL_ADDRESS non configuré", 500)
+		return
+	}
+	tx := transaction.NewTransaction(poolAddress, req.To, req.Amount, 0)
+	if !e.mp.Add(tx) {
+		jsonError(w, "Transaction invalide ou doublon", 400)
+		return
+	}
+	fmt.Printf("[Pool] Payout %d SCO → %s\n", req.Amount, req.To)
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "tx_id": tx.ID})
+}
+
+func (e *Explorer) apiAdminSetDifficulty(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST requis", 405)
+		return
+	}
+	// Localhost only
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	if host != "127.0.0.1" && host != "::1" {
+		http.Error(w, "Forbidden", 403)
+		return
+	}
+	var req struct {
+		Difficulty int `json:"difficulty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Difficulty < 4 || req.Difficulty > 32 {
+		jsonError(w, "difficulty invalide (4-32)", 400)
+		return
+	}
+	e.bc.Difficulty = req.Difficulty
+	e.bc.DifficultyForced = true
+	e.bc.Save()
+	fmt.Printf("[Admin] Difficulté forcée à %d\n", req.Difficulty)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "difficulty": req.Difficulty})
+}
+
+func (e *Explorer) apiAdminUnforceDifficulty(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST requis", 405)
+		return
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	if host != "127.0.0.1" && host != "::1" {
+		http.Error(w, "Forbidden", 403)
+		return
+	}
+	e.bc.DifficultyForced = false
+	e.bc.Save()
+	fmt.Printf("[Admin] DifficultyForced désactivé\n")
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
 }
 
@@ -4111,6 +5259,14 @@ func profileHTML(user *db.User, balance int, lang string) string {
       <span id="buy-pay-address" style="flex:1;word-break:break-all;"></span>
       <button class="buy-copy-btn" onclick="copyBuyAddr()">Copier</button>
     </div>
+    <div id="buy-xrp-memo-wrap" style="display:none;margin-bottom:0.8rem;">
+      <div style="font-size:0.75rem;color:#555;margin-bottom:0.3rem;">Mémo / Tag XRP</div>
+      <div class="buy-addr-box">
+        <span id="buy-pay-memo" style="flex:1;word-break:break-all;font-weight:700;color:#f5a623;"></span>
+        <button class="buy-copy-btn" onclick="copyBuyMemo()">Copier</button>
+      </div>
+      <div style="font-size:0.78rem;color:#e84040;margin-top:0.4rem;font-weight:600;">⚠ IMPORTANT : Ce mémo est obligatoire. Sans lui vos XRP seront perdus.</div>
+    </div>
     <div style="font-size:0.75rem;color:#555;margin-bottom:0.3rem;">Montant exact</div>
     <div class="buy-addr-box">
       <span id="buy-pay-amount" style="flex:1;"></span>
@@ -4495,7 +5651,7 @@ async function loadWidgetTab(){
     document.getElementById('wg-balance').textContent='%d SCO';
     document.getElementById('wg-received').textContent=received.toLocaleString()+' SCO';
     document.getElementById('wg-sent').textContent=sent.toLocaleString()+' SCO';
-    document.getElementById('wg-mined').textContent=minedCount+' ` + wgtl("blocs", "blocks") + ` · '+minedSCO.toLocaleString()+' SCO';
+    document.getElementById('wg-mined').textContent=minedCount+' `+wgtl("blocs", "blocks")+` · '+minedSCO.toLocaleString()+' SCO';
     wgRenderChart();
     wgApplyFilters();
   }catch(e){console.error(e);}
@@ -4526,13 +5682,13 @@ function wgRenderTable(){
   const tbody=document.getElementById('wg-tbody');
   if(!tbody)return;
   if(!wgFiltered.length){
-    tbody.innerHTML='<tr><td colspan="5" style="text-align:center;color:#555;padding:2rem;">` + wgtl("Aucune transaction", "No transactions") + `</td></tr>';
+    tbody.innerHTML='<tr><td colspan="5" style="text-align:center;color:#555;padding:2rem;">`+wgtl("Aucune transaction", "No transactions")+`</td></tr>';
     document.getElementById('wg-page-info').textContent='';
     document.getElementById('wg-prev').disabled=true;
     document.getElementById('wg-next').disabled=true;
     return;
   }
-  const badgeLabel={minage:'` + wgtl("Minage", "Mining") + `',réception:'` + wgtl("Reçu", "Received") + `',reception:'` + wgtl("Reçu", "Received") + `',envoi:'` + wgtl("Envoi", "Sent") + `',premine:'Premine'};
+  const badgeLabel={minage:'`+wgtl("Minage", "Mining")+`',réception:'`+wgtl("Reçu", "Received")+`',reception:'`+wgtl("Reçu", "Received")+`',envoi:'`+wgtl("Envoi", "Sent")+`',premine:'Premine'};
   const badgeCls={minage:'minage',réception:'reception',reception:'reception',envoi:'envoi',premine:'reception'};
   tbody.innerHTML=page.map(t=>{
     const d=new Date(t.timestamp*1000).toLocaleString([],{day:'2-digit',month:'2-digit',year:'2-digit',hour:'2-digit',minute:'2-digit'});
@@ -4659,6 +5815,10 @@ async function submitBuyOrder(){
   document.getElementById('buy-pay-address').textContent=order.address_to_pay;
   document.getElementById('buy-pay-amount').textContent=cryptoAmt+' '+buyCrypto.toUpperCase();
   document.getElementById('buy-qr-img').src='https://api.qrserver.com/v1/create-qr-code/?size=180x180&data='+encodeURIComponent(order.address_to_pay);
+  const memoWrap=document.getElementById('buy-xrp-memo-wrap');
+  const memoEl=document.getElementById('buy-pay-memo');
+  if(order.memo&&memoWrap&&memoEl){memoEl.textContent=order.memo;memoWrap.style.display='block';}
+  else if(memoWrap){memoWrap.style.display='none';}
   showBuyStep(2);
   startBuyTimer(order.expires_at);
   startBuyStatusPolling(order.id,order.sco_amount);
@@ -4710,6 +5870,11 @@ function copyBuyAddr(){
   navigator.clipboard.writeText(addr).then(()=>{}).catch(()=>{});
 }
 window.copyBuyAddr=copyBuyAddr;
+function copyBuyMemo(){
+  const memo=document.getElementById('buy-pay-memo').textContent;
+  navigator.clipboard.writeText(memo).then(()=>{}).catch(()=>{});
+}
+window.copyBuyMemo=copyBuyMemo;
 
 function copyBuyAmount(){
   const amt=document.getElementById('buy-pay-amount').textContent;
@@ -5401,8 +6566,12 @@ func page(title, content, active, lang string, user *db.User) string {
 		if len(addrShortNav) > 20 {
 			addrShortNav = addrShortNav[:10] + "..." + addrShortNav[len(addrShortNav)-6:]
 		}
+		navBadge := ""
+		if user.Pseudo == "Yousse" {
+			navBadge = `<span class="scorbits-badge" title="Scorbits Official"><span>S</span></span>`
+		}
 		navUserHTML = fmt.Sprintf(`<div class="nav-user-corner" id="nav-user-corner" onclick="toggleNavMenu()">
-  <div class="nav-user-btn">%s<span class="nav-pseudo">@%s</span><span class="nav-chevron">▾</span></div>
+  <div class="nav-user-btn">%s<span class="nav-pseudo">@%s</span>%s<span class="nav-chevron">▾</span></div>
   <div class="nav-user-menu hidden" id="nav-user-menu">
     <div class="nav-menu-header">%s<div><div class="nav-menu-pseudo">@%s</div><div class="nav-menu-addr">%s</div></div></div>
     <a href="/" class="nav-menu-item" onclick="document.getElementById('nav-user-menu').classList.add('hidden')">🏠 Home</a>
@@ -5410,11 +6579,12 @@ func page(title, content, active, lang string, user *db.User) string {
     <a href="/profile#profile" class="nav-menu-item" onclick="navigateToProfileTab('profile')">%s</a>
     <a href="/profile#wallet" class="nav-menu-item" onclick="navigateToProfileTab('wallet')">%s</a>
     <a href="/mine" class="nav-menu-item">%s</a>
+    <a href="/pool" class="nav-menu-item">Mining Pool</a>
     <div class="nav-menu-divider"></div>
     <a href="/wallet/logout" class="nav-menu-item nav-menu-logout">%s</a>
   </div>
 </div>`,
-			pic34, user.Pseudo,
+			pic34, user.Pseudo, navBadge,
 			pic48, user.Pseudo, addrShortNav,
 			i18n.T(lang, "nav.my_profile"),
 			i18n.T(lang, "nav.my_wallet"),
@@ -5452,6 +6622,7 @@ func page(title, content, active, lang string, user *db.User) string {
     <span class="dm-badge" id="dm-badge">0</span>
   </button>
 </div>
+<div id="notif-toast-container"></div>
 <div id="dm-window" class="dm-window hidden">
   <div id="dm-view-convs" class="dm-view">
     <div class="dm-header">
@@ -5560,7 +6731,10 @@ func page(title, content, active, lang string, user *db.User) string {
 <div id="publish-modal-overlay" class="publish-modal-overlay hidden" onclick="if(event.target===this)closePublishModal()">
   <div class="publish-modal">
     <div class="publish-modal-title">` + i18n.T(lang, "common.new_post") + `</div>
-    <textarea id="publish-content" class="publish-textarea" placeholder="` + i18n.T(lang, "common.what_new") + `" maxlength="500" oninput="updatePublishCount()"></textarea>
+    <div style="position:relative;">
+      <textarea id="publish-content" class="publish-textarea" placeholder="` + i18n.T(lang, "common.what_new") + `" maxlength="500" oninput="updatePublishCount()"></textarea>
+      <div class="chat-mentions-list hidden" id="publish-mentions" style="bottom:auto;top:100%;z-index:100"></div>
+    </div>
     <div class="publish-charcount"><span id="publish-count">0</span>/500</div>
     <div id="publish-img-preview" class="publish-img-preview hidden"></div>
     <div class="publish-toolbar">
@@ -5585,8 +6759,10 @@ func page(title, content, active, lang string, user *db.User) string {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>` + title + ` — Scorbits</title>
-<link rel="icon" type="image/png" href="/static/scorbits_logo.png">
-<link rel="apple-touch-icon" href="/static/scorbits_logo.png">
+<link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+<link rel="icon" type="image/png" sizes="32x32" href="/static/favicon.ico">
+<link rel="icon" type="image/png" sizes="16x16" href="/static/favicon-16.png">
+<link rel="apple-touch-icon" sizes="192x192" href="/static/favicon-192.png">
 <meta property="og:image" content="https://scorbits.com/static/scorbits_logo.png">
 <meta property="og:title" content="Scorbits (SCO) — Blockchain Explorer">
 <meta property="og:description" content="Explore the Scorbits blockchain. Mine SCO, send transactions, and track the network in real time.">
@@ -5646,6 +6822,25 @@ nav{display:flex;gap:0.3rem;align-items:center;}
 .search-form input::placeholder{color:var(--muted);}
 .search-form button{background:var(--green3);border:1px solid var(--green3);color:var(--green);padding:8px 14px;border-radius:0 6px 6px 0;cursor:pointer;font-size:0.85rem;font-weight:600;transition:all .2s;font-family:'Inter',sans-serif;}
 .search-form button:hover{background:var(--green2);color:#000;}
+
+/* HEADER — MOBILE */
+@media(max-width:768px){
+  header{padding:0 0.75rem;height:auto;min-height:52px;flex-wrap:wrap;row-gap:0;}
+  .logo{position:static;transform:none;order:1;flex:1;min-width:0;padding:8px 0;}
+  .logo img{height:32px!important;max-height:40px!important;}
+  .logo-text{font-size:1rem;}
+  .nav-user-corner{order:2;flex-shrink:0;padding:8px 0;}
+  .nav-auth-buttons{order:2;flex-shrink:0;padding:8px 0;}
+  .header-right{order:3;width:100%;padding:0.3rem 0 0.4rem;gap:0;}
+  .header-right>div{width:100%;flex-wrap:nowrap;gap:0.3rem;}
+  .lang-selector{display:none!important;}
+  .search-form{width:100%;flex:1;display:flex;}
+  .search-form input{width:auto!important;flex:1;min-width:0;}
+  .nav-pseudo{display:none!important;}
+}
+@media(max-width:768px){
+  .ticker-wrap{top:98px;}
+}
 
 /* HALVING BAR */
 .ticker-wrap{background:linear-gradient(90deg,#b34700 0%,#e67e00 15%,#f5a623 35%,#f5d050 55%,#ffe566 75%,#C8A01E 100%);border-bottom:1px solid rgba(0,0,0,0.2);height:32px;position:sticky;top:64px;z-index:199;display:flex;align-items:center;justify-content:center;padding:0 1.5rem;}
@@ -6012,51 +7207,70 @@ footer{text-align:center;padding:1.8rem;color:var(--muted);font-size:0.8rem;bord
 .news-empty{color:var(--muted);font-size:0.78rem;padding:0.4rem 0;}
 
 /* POSTS FEED */
-.posts-feed{height:500px;overflow-y:auto;border:1px solid var(--green3);border-radius:12px;background:var(--bg2);padding:1rem;}
+.posts-feed{height:500px;overflow-y:auto;border:1px solid rgba(0,232,90,0.15);border-radius:12px;background:#0d1b2a;padding:1rem;}
+.ann-card{background:#0a1628;border:2px solid #1e90ff;border-radius:12px;padding:1.2rem 1.4rem;margin-bottom:1.2rem;box-shadow:0 4px 24px rgba(30,144,255,0.12);}
+.ann-card-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:.75rem;gap:.5rem;}
+.ann-official-badge{background:rgba(30,144,255,0.15);color:#1e90ff;font-size:.72rem;font-weight:700;padding:3px 10px;border-radius:20px;border:1px solid rgba(30,144,255,0.35);white-space:nowrap;}
+.ann-card-date{font-size:.72rem;color:#5a7a9a;white-space:nowrap;}
+.ann-title{font-size:1.1rem;font-weight:700;color:#fff;margin-bottom:.6rem;line-height:1.35;}
+.ann-badge{background:#1e90ff22;color:#1e90ff;font-size:.7rem;padding:2px 8px;border-radius:4px;margin-left:8px;}
+.ann-content{font-size:.88rem;color:#d0e0f0;line-height:1.65;}
+.ann-content img{max-width:100%%;border-radius:8px;margin-top:.5rem;}
+.ann-content a{color:#5bc8ff;text-decoration:underline;}
+.ann-cover-img{width:100%%;border-radius:8px;margin-top:.8rem;display:block;max-height:360px;object-fit:cover;}
+.ann-date{font-size:.75rem;color:#5a7a9a;margin-top:.5rem;}
+.ann-toolbar{display:flex;flex-wrap:wrap;gap:.4rem;margin-bottom:.5rem;}
+.ann-toolbar button,.ann-toolbar-upload{background:#1e1e1e;border:1px solid #333;border-radius:4px;padding:3px 10px;color:#ccc;cursor:pointer;font-size:.8rem;}
+.ann-toolbar button:hover,.ann-toolbar-upload:hover{background:#2a2a2a;color:#fff;}
+.ann-toolbar-upload{display:inline-flex;align-items:center;gap:4px;}
+.ann-editor{min-height:120px;background:#111;border:1px solid #222;border-radius:6px;padding:.6rem;color:#fff;font-size:.9rem;line-height:1.6;margin-bottom:.75rem;outline:none;}
+.ann-editor:empty:before{content:attr(placeholder);color:#555;pointer-events:none;}
+.ann-preview{min-height:60px;background:#0d0d0d;border:1px solid #1e1e1e;border-radius:6px;padding:.6rem;color:#ccc;font-size:.9rem;line-height:1.6;}
+.ann-preview img{max-width:100%%;border-radius:6px;}
 .posts-feed::-webkit-scrollbar{width:5px;}
 .posts-feed::-webkit-scrollbar-track{background:transparent;}
 .posts-feed::-webkit-scrollbar-thumb{background:var(--green3);border-radius:3px;}
 .posts-feed::-webkit-scrollbar-thumb:hover{background:var(--green2);}
 .posts-loading,.posts-empty{color:var(--muted);font-size:0.78rem;padding:0.4rem 0;}
-.post-card{background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:1rem;margin-bottom:0.6rem;transition:border-color .15s;}
+.post-card{background:#0a1628;border:1px solid rgba(0,232,90,0.1);border-radius:10px;padding:1rem;margin-bottom:0.6rem;box-shadow:0 2px 8px rgba(0,0,0,0.3);transition:border-color .15s;}
 .post-card:last-child{margin-bottom:0;}
-.post-card:hover{border-color:var(--green3);}
+.post-card:hover{border-color:rgba(0,232,90,0.3);}
 .post-header{display:flex;align-items:center;gap:0.5rem;margin-bottom:0.5rem;}
 .post-avatar{cursor:pointer;flex-shrink:0;line-height:0;}
 .post-meta{display:flex;align-items:center;gap:0.5rem;flex:1;}
-.post-pseudo{font-size:0.8rem;font-weight:700;color:var(--green2);cursor:pointer;}
-.post-pseudo:hover{color:var(--green);}
-.post-age{font-size:0.68rem;color:var(--muted);margin-left:auto;}
-.post-content{font-size:0.84rem;color:var(--text);line-height:1.55;word-break:break-word;margin-bottom:0.55rem;}
+.post-pseudo{font-size:0.8rem;font-weight:700;color:#5bc8ff;cursor:pointer;}
+.post-pseudo:hover{color:#8dd8ff;}
+.post-age{font-size:0.68rem;color:#4a6080;margin-left:auto;}
+.post-content{font-size:0.84rem;color:#ffffff;line-height:1.55;word-break:break-word;margin-bottom:0.55rem;}
 .post-image{max-width:100%;max-height:280px;object-fit:cover;border-radius:10px;border:1px solid var(--green3);display:block;cursor:pointer;margin:0.5rem 0;transition:opacity .15s;}.post-image:hover{opacity:0.85;}
 #img-lightbox{display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.92);align-items:center;justify-content:center;cursor:zoom-out;}
 #img-lightbox.open{display:flex;}
 #img-lightbox img{max-width:90vw;max-height:90vh;border-radius:8px;object-fit:contain;box-shadow:0 8px 40px rgba(0,0,0,0.8);}
 .post-actions{display:flex;gap:0.4rem;flex-wrap:wrap;}
-.post-react-btn{background:var(--bg2);border:1px solid var(--border);color:var(--text2);padding:3px 8px;border-radius:12px;font-size:0.7rem;cursor:pointer;transition:all .15s;font-family:'Inter',sans-serif;}
-.post-react-btn:hover{border-color:var(--green3);color:var(--green);}
-.post-comment-btn,.post-view-btn{background:none;border:1px solid var(--border);color:var(--muted);padding:3px 8px;border-radius:12px;font-size:0.7rem;cursor:pointer;transition:all .15s;font-family:'Inter',sans-serif;}
-.post-comment-btn:hover,.post-view-btn:hover{border-color:var(--green3);color:var(--green2);}
-.post-comment-input{flex:1;background:var(--bg2);border:1px solid var(--green3);color:var(--text);padding:5px 9px;border-radius:5px;font-family:'Inter',sans-serif;font-size:0.8rem;outline:none;}
-.post-comment-submit{background:var(--green3);border:1px solid var(--green2);color:var(--green);padding:5px 10px;border-radius:5px;font-size:0.78rem;font-weight:600;cursor:pointer;font-family:'Inter',sans-serif;transition:all .2s;white-space:nowrap;}
-.post-comment-submit:hover{background:var(--green2);color:#000;}
-.comment-item{display:flex;gap:0.5rem;align-items:flex-start;padding:0.5rem 0;border-bottom:1px solid var(--border);}
+.post-react-btn{background:rgba(0,232,90,0.07);border:1px solid rgba(0,232,90,0.2);color:#00e85a;padding:3px 8px;border-radius:12px;font-size:0.7rem;cursor:pointer;transition:all .15s;font-family:'Inter',sans-serif;}
+.post-react-btn:hover{background:rgba(0,232,90,0.15);border-color:rgba(0,232,90,0.4);color:#00e85a;}
+.post-comment-btn,.post-view-btn{background:rgba(0,232,90,0.07);border:1px solid rgba(0,232,90,0.2);color:#00b847;padding:3px 8px;border-radius:12px;font-size:0.7rem;cursor:pointer;transition:all .15s;font-family:'Inter',sans-serif;}
+.post-comment-btn:hover,.post-view-btn:hover{background:rgba(0,232,90,0.15);border-color:rgba(0,232,90,0.4);color:#00e85a;}
+.post-comment-input{flex:1;background:#071020;border:1px solid rgba(0,232,90,0.25);color:#fff;padding:5px 9px;border-radius:6px;font-family:'Inter',sans-serif;font-size:0.8rem;outline:none;transition:border-color .2s;}.post-comment-input:focus{border-color:#00e85a;}.post-comment-input::placeholder{color:#4a6a4a;}
+.post-comment-submit{background:rgba(0,232,90,0.07);border:1px solid rgba(0,232,90,0.2);color:#00e85a;padding:5px 10px;border-radius:6px;font-size:0.78rem;font-weight:600;cursor:pointer;font-family:'Inter',sans-serif;transition:all .2s;white-space:nowrap;}
+.post-comment-submit:hover{background:rgba(0,232,90,0.18);border-color:#00e85a;color:#00e85a;}
+.comment-item{display:flex;gap:0.5rem;align-items:flex-start;padding:0.5rem 0;border-bottom:1px solid rgba(255,255,255,0.06);}
 .comment-item:last-child{border-bottom:none;}
 .comment-avatar{flex-shrink:0;line-height:0;}
 .comment-body{flex:1;}
-.comment-pseudo{font-size:0.78rem;font-weight:700;color:var(--green2);}
-.comment-age{font-size:0.65rem;color:var(--muted);margin-left:0.4rem;}
-.comment-text{font-size:0.8rem;color:var(--text);line-height:1.5;margin-top:0.15rem;word-break:break-word;}
+.comment-pseudo{font-size:0.78rem;font-weight:700;color:#5bc8ff;}
+.comment-age{font-size:0.65rem;color:#4a6080;margin-left:0.4rem;}
+.comment-text{font-size:0.8rem;color:#e8e8e8;line-height:1.5;margin-top:0.15rem;word-break:break-word;}
+.cmt-actions{display:flex;gap:0.6rem;margin-top:0.3rem;align-items:center;}
+.cmt-like-btn{background:none;border:none;cursor:pointer;font-size:0.78rem;padding:0;display:inline-flex;align-items:center;gap:2px;}
+.cmt-reply-btn{background:none;border:none;cursor:pointer;font-size:0.78rem;color:#666;padding:0;}
+.cmt-reply-btn:hover{color:#00e85a;}
+.cmt-reply-box{display:flex;gap:0.4rem;margin-top:0.4rem;align-items:center;}
+.cmt-reply-box.hidden{display:none;}
 
-/* BLOCK PROGRESS BAR */
+/* BLOCK TIMER */
 .block-progress-wrap{background:#071020;border:1px solid #1a2a1a;border-radius:12px;padding:14px 16px;margin-bottom:0.6rem;}
-.bp-bar-outer{width:100%;height:7px;background:var(--bg);border-radius:4px;overflow:hidden;margin:0.5rem 0 0.35rem;}
-.bp-bar-fill{height:100%;background:linear-gradient(90deg,#00e85a,#7fff7f);border-radius:4px;width:0%;transition:width 1s linear;}
-@keyframes bp-pulse{0%,100%{box-shadow:0 0 4px rgba(0,232,90,0.5)}50%{box-shadow:0 0 12px rgba(0,232,90,0.9)}}
-.bp-bar-fill.pulse{animation:bp-pulse 1.4s infinite;background:var(--green);}
-.bp-elapsed{font-size:0.7rem;color:var(--text2);}
-.bp-time{font-size:0.7rem;color:var(--muted);text-align:right;}
-.bp-time{font-size:0.72rem;color:var(--muted);text-align:right;}
+.bp-elapsed{font-size:0.78rem;color:var(--text2);}
 
 
 /* POST DELETE BUTTON & ACTIVE REACTIONS */
@@ -6076,16 +7290,17 @@ footer{text-align:center;padding:1.8rem;color:var(--muted);font-size:0.8rem;bord
 .publish-fab{position:fixed;bottom:1.8rem;right:5.5rem;z-index:300;width:50px;height:50px;background:#4f9fff;border-radius:50%;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 4px 18px rgba(79,159,255,0.45);transition:all .2s;color:#fff;}
 .publish-fab:hover{transform:scale(1.08);}
 .publish-modal-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.78);z-index:500;display:flex;align-items:center;justify-content:center;}
-.publish-modal{background:var(--bg2);border:1px solid var(--green3);border-radius:14px;padding:1.8rem;max-width:440px;width:90%;box-shadow:0 0 60px rgba(0,0,0,0.8);}
-.publish-modal-title{font-size:1rem;font-weight:700;margin-bottom:0.9rem;}
-.publish-textarea{width:100%;background:var(--bg3);border:1px solid var(--green3);color:var(--text);padding:0.8rem;border-radius:7px;font-family:'Inter',sans-serif;font-size:0.88rem;outline:none;resize:vertical;min-height:100px;line-height:1.55;transition:border-color .2s;}
-.publish-textarea:focus{border-color:var(--green2);}
+.publish-modal{background:#0a1628;border:1px solid rgba(0,232,90,0.2);border-radius:14px;padding:1.8rem;max-width:440px;width:90%;box-shadow:0 0 60px rgba(0,0,0,0.8);}
+.publish-modal-title{font-size:1rem;font-weight:700;margin-bottom:0.9rem;color:#fff;}
+.publish-textarea{width:100%;background:#071020;border:1px solid rgba(0,232,90,0.25);color:#fff;padding:0.8rem;border-radius:7px;font-family:'Inter',sans-serif;font-size:0.88rem;outline:none;resize:vertical;min-height:100px;line-height:1.55;transition:border-color .2s;}
+.publish-textarea:focus{border-color:#00e85a;}
+.publish-textarea::placeholder{color:#4a6a4a;}
 .publish-charcount{font-size:0.72rem;color:var(--muted);text-align:right;margin-top:0.3rem;margin-bottom:0.8rem;}
 .publish-actions{display:flex;gap:0.7rem;justify-content:flex-end;}
 .publish-cancel-btn{background:transparent;border:1px solid var(--border);color:var(--text2);padding:8px 18px;border-radius:6px;cursor:pointer;font-family:'Inter',sans-serif;font-size:0.88rem;transition:all .2s;}
 .publish-cancel-btn:hover{border-color:var(--green3);}
-.publish-submit-btn{background:#4f9fff;border:none;color:#fff;padding:8px 22px;border-radius:6px;cursor:pointer;font-family:'Inter',sans-serif;font-size:0.88rem;font-weight:700;transition:all .2s;}
-.publish-submit-btn:hover{background:#3a8aee;}
+.publish-submit-btn{background:rgba(0,232,90,0.07);border:1px solid rgba(0,232,90,0.3);color:#00e85a;padding:8px 22px;border-radius:6px;cursor:pointer;font-family:'Inter',sans-serif;font-size:0.88rem;font-weight:700;transition:all .2s;}
+.publish-submit-btn:hover{background:rgba(0,232,90,0.18);border-color:#00e85a;}
 .publish-toolbar{display:flex;gap:0.4rem;margin-bottom:0.6rem;}
 .publish-tool-btn{background:var(--bg3);border:1px solid var(--green3);color:var(--text2);padding:5px 10px;border-radius:6px;cursor:pointer;font-size:0.88rem;font-family:'Inter',sans-serif;transition:all .2s;}
 .publish-tool-btn:hover{border-color:var(--green2);color:var(--green);}
@@ -6114,7 +7329,15 @@ footer{text-align:center;padding:1.8rem;color:var(--muted);font-size:0.8rem;bord
 .chat-msg-body{color:#ffffff;font-weight:500;font-size:14px;line-height:1.5;padding-left:24px;word-break:break-word;}
 .chat-msg-body a{color:var(--green2);}
 .chat-mention{color:#00e85a;font-weight:600;}
+.mention-link{color:#5bc8ff;font-weight:600;cursor:pointer;text-decoration:none;}
+.mention-link:hover{text-decoration:underline;}
 .chat-gif img{max-width:160px;max-height:120px;border-radius:6px;margin-top:0.25rem;display:block;}
+.chat-img{max-width:200px;max-height:200px;border-radius:8px;cursor:pointer;margin-top:4px;display:block;}
+.chat-media-preview{position:relative;display:inline-block;padding:6px 8px;background:rgba(255,255,255,0.04);border-top:1px solid rgba(0,232,90,0.1);width:100%;box-sizing:border-box;}
+.chat-media-preview.hidden{display:none;}
+.chat-media-preview-img{max-height:120px;max-width:100%;border-radius:6px;display:block;}
+.chat-media-cancel{position:absolute;top:4px;right:6px;background:#c0392b;border:none;color:#fff;border-radius:50%;width:20px;height:20px;font-size:12px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;z-index:1;}
+.chat-img-btn{cursor:pointer;background:#0a1628;border:1px solid rgba(0,232,90,0.25);border-radius:6px;padding:4px 8px;font-size:1rem;color:#ccc;display:inline-flex;align-items:center;line-height:1;}
 .chat-reactions{display:flex;flex-wrap:wrap;gap:0.2rem;padding-left:24px;margin-top:0.15rem;}
 .chat-reaction-chip{background:rgba(0,232,90,0.07);border:1px solid rgba(0,232,90,0.2);color:var(--text2);font-size:0.72rem;padding:1px 6px;border-radius:10px;cursor:pointer;transition:all .15s;}
 .chat-reaction-chip:hover{border-color:var(--green);color:var(--green);}
@@ -6197,6 +7420,16 @@ footer{text-align:center;padding:1.8rem;color:var(--muted);font-size:0.8rem;bord
 .notif-empty{padding:1.5rem;text-align:center;color:var(--muted);font-size:0.85rem;}
 @keyframes notif-flash{0%,100%{background:transparent;}50%{background:rgba(0,232,90,0.15);border-radius:8px;}}
 .notif-highlight{animation:notif-flash 0.6s ease-in-out 3;}
+/* NOTIFICATION TOASTS */
+#notif-toast-container{position:fixed;bottom:24px;right:24px;z-index:99999;display:flex;flex-direction:column-reverse;gap:10px;pointer-events:none;}
+.notif-toast{pointer-events:all;background:#0d1b2a;color:#fff;border:1px solid rgba(0,232,90,0.25);border-radius:8px;box-shadow:0 4px 24px rgba(0,0,0,0.5);padding:12px 14px;min-width:280px;max-width:340px;display:flex;align-items:flex-start;gap:10px;transform:translateX(120%);opacity:0;transition:transform 0.35s cubic-bezier(0.22,1,0.36,1),opacity 0.25s;}
+.notif-toast.toast-in{transform:translateX(0);opacity:1;}
+.notif-toast.toast-out{transform:translateX(120%);opacity:0;}
+.notif-toast-icon{width:32px;height:32px;border-radius:50%;background:#132035;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;color:#00e85a;flex-shrink:0;}
+.notif-toast-body{flex:1;min-width:0;}
+.notif-toast-text{font-size:13px;color:#e0e0e0;line-height:1.35;margin-bottom:2px;}
+.notif-toast-preview{font-size:11px;color:#7a8fa6;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.notif-toast-close{background:none;border:none;color:#7a8fa6;cursor:pointer;font-size:16px;line-height:1;padding:0 0 0 4px;flex-shrink:0;align-self:flex-start;}
 
 /* DM WINDOW */
 .dm-open-btn{background:#071020;border:1px solid #00e85a;color:#00e85a;border-radius:50px;padding:10px 16px;font-size:0.82rem;font-weight:700;cursor:pointer;font-family:'Inter',sans-serif;transition:all .2s;display:flex;align-items:center;gap:0.4rem;position:relative;}
@@ -6331,6 +7564,8 @@ footer{text-align:center;padding:1.8rem;color:var(--muted);font-size:0.8rem;bord
 .blocked-user-row:last-child{border-bottom:none;}
 .blocked-user-avatar{display:inline-flex;flex-shrink:0;}
 .blocked-user-pseudo{flex:1;font-size:0.88rem;font-weight:600;color:var(--text2);}
+.scorbits-badge{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:50%;background:#00e85a;border:2px solid #000;margin-left:4px;flex-shrink:0;vertical-align:middle;font-size:9px;font-weight:800;color:#000;box-shadow:0 0 6px rgba(0,232,90,0.5);position:relative;top:-1px;}
+.scorbits-badge span{color:#f5a623;font-weight:900;font-size:9px;line-height:1;}
 </style>
 <script>const I18N=` + i18nJSON + `;const LANG='` + lang + `';</script>
 </head>
@@ -6378,6 +7613,8 @@ footer{text-align:center;padding:1.8rem;color:var(--muted);font-size:0.8rem;bord
     <a href="/static/Scorbits_Whitepaper_FR.docx" download class="footer-wp-link">&#x1F1EB;&#x1F1F7; Whitepaper FR &#x2193;</a>
     <a href="/node" class="footer-wp-link">Run a Node</a>
     <a href="/wallets" class="footer-wp-link">Wallets</a>
+    <a href="/transactions" class="footer-wp-link">Transactions</a>
+    <a href="/pool" class="footer-wp-link">Mining Pool</a>
   </div>
 </footer>
 ` + publishFAB + `
@@ -6399,6 +7636,12 @@ const CHAT_IS_ADMIN = IS_ADMIN;
 const CURRENT_PSEUDO = '` + strings.ReplaceAll(strings.ReplaceAll(userPseudo, `\`, `\\`), `'`, `\'`) + `';
 const CURRENT_USER_ID = '` + userIDHex + `';
 I18N['_pseudo']=CURRENT_PSEUDO;
+function renderAdminBadge(pseudo) {
+  if (pseudo === 'Yousse') {
+    return '<span class="scorbits-badge" title="Scorbits Official"><span>S</span></span>';
+  }
+  return '';
+}
 function setLang(l){fetch('/set-lang',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lang:l})}).then(()=>window.location.reload());}
 function toggleNavMenu(){const corner=document.getElementById('nav-user-corner');const menu=document.getElementById('nav-user-menu');if(!corner||!menu)return;menu.classList.toggle('hidden');corner.classList.toggle('open');}
 document.addEventListener('click',function(e){const corner=document.getElementById('nav-user-corner');const menu=document.getElementById('nav-user-menu');if(corner&&menu&&!corner.contains(e.target)){menu.classList.add('hidden');corner.classList.remove('open');}});
@@ -7662,6 +8905,61 @@ function loadNotifCount() {
   }).catch(function(){});
 }
 
+// ─── NOTIFICATION POLLING (every 10s) ─────────────────────────────────────────
+var _notifPollSince = Math.floor(Date.now() / 1000);
+
+function pollNotifications() {
+  fetch('/api/notifications/poll?since=' + _notifPollSince)
+    .then(function(r){ return r.json(); })
+    .then(function(notifs) {
+      if (!notifs || !notifs.length) return;
+      _notifPollSince = Math.floor(Date.now() / 1000);
+      // Update badge
+      loadNotifCount();
+      // Show one toast per new notification
+      notifs.forEach(function(n) { showNotifToast(n); });
+    })
+    .catch(function(){});
+}
+
+function showNotifToast(n) {
+  var container = document.getElementById('notif-toast-container');
+  if (!container) return;
+  var toast = document.createElement('div');
+  toast.className = 'notif-toast';
+  var initial = (n.fromUsername || '?')[0].toUpperCase();
+  var text = '<strong style="color:#00e85a;">@' + (n.fromUsername || 'Anonyme') + '</strong> ';
+  if (n.type === 'mention') {
+    text += 'vous a mentionné';
+  } else {
+    text += 'a commenté votre publication';
+  }
+  toast.innerHTML =
+    '<div class="notif-toast-icon">' + initial + '</div>' +
+    '<div class="notif-toast-body">' +
+      '<div class="notif-toast-text">' + text + '</div>' +
+      (n.commentPreview ? '<div class="notif-toast-preview">' + n.commentPreview + '</div>' : '') +
+    '</div>' +
+    '<button class="notif-toast-close" onclick="this.parentNode.remove()">✕</button>';
+  toast.onclick = function(e) {
+    if (e.target.classList.contains('notif-toast-close')) return;
+    goToNotif(n._id, n.postID);
+    toast.remove();
+  };
+  container.appendChild(toast);
+  // Animate in
+  requestAnimationFrame(function() {
+    requestAnimationFrame(function() { toast.classList.add('toast-in'); });
+  });
+  // Auto-dismiss after 5s
+  var timer = setTimeout(function() {
+    toast.classList.remove('toast-in');
+    toast.classList.add('toast-out');
+    setTimeout(function() { toast.remove(); }, 400);
+  }, 5000);
+  toast.addEventListener('mouseenter', function() { clearTimeout(timer); });
+}
+
 // Close panel on outside click
 document.addEventListener('click', function(e) {
   if (!notifPanelOpen) return;
@@ -7672,6 +8970,7 @@ document.addEventListener('click', function(e) {
   }
 });
 
+function clickNotif(id, postID) { goToNotif(id, postID); }
 window.toggleNotifPanel = toggleNotifPanel;
 window.markAllNotifsRead = markAllNotifsRead;
 window.clickNotif = clickNotif;
@@ -7679,6 +8978,11 @@ window.clickNotif = clickNotif;
 if (typeof IS_LOGGED_IN !== 'undefined' && IS_LOGGED_IN === 'true' || IS_LOGGED_IN === true) {
   loadNotifCount();
   setInterval(loadNotifCount, 30000);
+  // Poll for new notifications every 10s
+  setTimeout(function() {
+    pollNotifications();
+    setInterval(pollNotifications, 10000);
+  }, 5000);
 }
 
 // ─── NAV SEARCH ───
@@ -7739,6 +9043,7 @@ type SCOOrder struct {
 	CreatedAt    time.Time     `bson:"created_at" json:"created_at"`
 	ExpiresAt    time.Time     `bson:"expires_at" json:"expires_at"`
 	TxDetected   bool          `bson:"tx_detected" json:"tx_detected"`
+	Memo         string        `bson:"memo,omitempty" json:"memo,omitempty"`
 }
 
 // apiScoPrice returns live BTC/DOGE/XRP→EUR rates and SCO price
@@ -7771,9 +9076,9 @@ func (e *Explorer) apiScoPrice(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"btc":          btcRate,
-		"doge":         dogeRate,
-		"xrp":          xrpRate,
+		"btc":           btcRate,
+		"doge":          dogeRate,
+		"xrp":           xrpRate,
 		"sco_price_eur": 0.07,
 	})
 }
@@ -7832,13 +9137,13 @@ func (e *Explorer) apiScoOrder(w http.ResponseWriter, r *http.Request) {
 	switch req.Crypto {
 	case "btc":
 		cryptoRateEUR = cg["bitcoin"]["eur"]
-		addressToPay = "bc1q8tfzhy65ay0jykhue6hyqx8yks85gjsv65j2qz"
+		addressToPay = "15ZHZNfNpdK9QecvJz4FHkmiBSY2tXKpxm"
 	case "doge":
 		cryptoRateEUR = cg["dogecoin"]["eur"]
-		addressToPay = "DSbHD5jrzLYWD3Wmga9Kt3ZeVsMD9Uc6MD"
+		addressToPay = "DKgohnvSCv4uchHoAUG4eXNEDXzZGdGC2E"
 	case "xrp":
 		cryptoRateEUR = cg["ripple"]["eur"]
-		addressToPay = "rHX4NwZMy338vhpvZb7Fmxvn86uuv1QBGC"
+		addressToPay = "rNxp4h8apvRis6mJf9Sh8C6iRxfrDWN7AV"
 	default:
 		jsonError(w, "Crypto non supportée (btc/doge/xrp)", 400)
 		return
@@ -7853,6 +9158,10 @@ func (e *Explorer) apiScoOrder(w http.ResponseWriter, r *http.Request) {
 	scoAmount := req.AmountEUR / 0.07
 	now := time.Now()
 
+	memo := ""
+	if req.Crypto == "xrp" {
+		memo = "415404296"
+	}
 	order := SCOOrder{
 		Crypto:       req.Crypto,
 		AmountEUR:    req.AmountEUR,
@@ -7865,6 +9174,7 @@ func (e *Explorer) apiScoOrder(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:    now,
 		ExpiresAt:    now.Add(30 * time.Minute),
 		TxDetected:   false,
+		Memo:         memo,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -8245,6 +9555,48 @@ func (e *Explorer) handleWallets(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, page("Wallets SCO — Scorbits", walletsHTML(lang), "wallets", lang, user))
 }
 
+func (e *Explorer) handleTransactions(w http.ResponseWriter, r *http.Request) {
+	lang := i18n.DetectLang(r)
+	user, _ := auth.GetSession(r)
+	content := `
+<div style="max-width:900px;margin:0 auto">
+  <div class="stitle">All Transactions</div>
+  <div class="tbox">
+    <table>
+      <thead><tr>
+        <th>Block</th><th>From</th><th>To</th><th>Amount</th><th>Time</th>
+      </tr></thead>
+      <tbody id="tx-all-list"><tr><td colspan="5" style="text-align:center;color:var(--muted)">Loading...</td></tr></tbody>
+    </table>
+  </div>
+</div>
+<script>
+(async () => {
+  const res = await fetch('/api/transactions');
+  const txs = await res.json() || [];
+  const el = document.getElementById('tx-all-list');
+  if (!txs.length) {
+    el.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--muted)">No transactions yet</td></tr>';
+    return;
+  }
+  el.innerHTML = txs.map(t => {
+    const fromShort = t.from.length > 18 ? t.from.slice(0,10)+'...'+t.from.slice(-6) : t.from;
+    const toShort = t.to.length > 18 ? t.to.slice(0,10)+'...'+t.to.slice(-6) : t.to;
+    const d = new Date(t.timestamp*1000).toLocaleString([], {day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
+    return '<tr onclick="window.location=\'/block/'+t.block+'\'">' +
+      '<td><span class="badge">#'+t.block+'</span></td>' +
+      '<td class="mono sm" title="'+t.from+'">'+fromShort+'</td>' +
+      '<td class="mono sm" title="'+t.to+'">'+toShort+'</td>' +
+      '<td class="green fw6">'+t.amount+' SCO</td>' +
+      '<td class="muted sm">'+d+'</td>' +
+    '</tr>';
+  }).join('');
+})();
+</script>`
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, page("Transactions — Scorbits", content, "explorer", lang, user))
+}
+
 func walletsHTML(lang string) string {
 	fr := lang == "fr"
 	tl := func(frStr, enStr string) string {
@@ -8381,4 +9733,362 @@ function toggleFaq(btn){
 }
 </script>
 `
+}
+
+// ─── /pool page ───────────────────────────────────────────────────────────────
+
+func (e *Explorer) handlePool(w http.ResponseWriter, r *http.Request) {
+	lang := i18n.DetectLang(r)
+	user, _ := auth.GetSession(r)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, page("Scorbits Pool", poolHTML(lang), "pool", lang, user))
+}
+
+func poolHTML(lang string) string {
+	fr := lang == "fr"
+	tl := func(frStr, enStr string) string {
+		if fr {
+			return frStr
+		}
+		return enStr
+	}
+
+	// HTML-embedded translations
+	poolOnline  := tl("Pool en ligne", "Pool Online")
+	heroDesc    := tl("Mine SCO en rejoignant le pool officiel Scorbits. Les récompenses sont partagées proportionnellement au hashrate fourni.", "Mine SCO by joining the official Scorbits pool. Rewards are shared proportionally based on hashrate contributed.")
+	lblHashrate := tl("Hashrate pool", "Pool Hashrate")
+	lblWorkers  := tl("Workers actifs", "Active Workers")
+	lblBlocks   := tl("Blocs trouvés", "Blocks Found")
+	lblFee      := tl("Frais pool", "Pool Fee")
+	lblCountdown := tl("Prochain paiement dans", "Next payout in")
+	h2Connect   := tl("Se connecter au pool", "Connect to the pool")
+	lblServer   := tl("Serveur", "Server")
+	lblProtocol := tl("Protocole", "Protocol")
+	lblUser     := tl("Utilisateur", "Username")
+	lblPassword := tl("Mot de passe", "Password")
+	h2HowTo    := tl("Comment miner avec le pool", "How to mine with the pool")
+	step1Text  := tl("Télécharge le miner CLI Scorbits depuis", "Download the Scorbits CLI miner from")
+	step1Mine  := tl("la page Mine", "the Mine page")
+	step1Src   := tl("ou compile depuis les sources.", "or compile from source.")
+	step2Text  := tl("Lance le miner en mode pool :", "Launch the miner in pool mode:")
+	step3Text  := tl("Les SCO minés sont distribués automatiquement vers ton adresse SCO. Vérifie ton solde sur", "Mined SCO are automatically distributed to your SCO address. Check your balance on")
+	step3Wallet := tl("ton wallet", "your wallet")
+	h2Workers  := tl("Workers connectés", "Connected Workers")
+	h2Blocks   := tl("Derniers blocs trouvés", "Latest blocks found")
+	loadingTxt := tl("Chargement...", "Loading...")
+
+	// JS string variables (injected as JS literals using double-quote delimiters)
+	jsNoWorkers  := tl("Aucun worker connecté actuellement.", "No workers connected at the moment.")
+	jsAddrTh    := tl("Adresse", "Address")
+	jsLastAct   := tl("Derniere activite", "Last activity")
+	jsLastUpd   := tl("Mis a jour :", "Last update:")
+	jsPoolErr   := tl("Impossible de contacter le pool. Verifiez que le service est actif.", "Unable to reach the pool. Please check that the service is running.")
+	jsNoBlocks  := tl("Aucun bloc trouve par le pool pour l'instant.", "No blocks found by the pool yet.")
+	jsMiner     := tl("Mineur", "Miner")
+	jsReward    := tl("Recompense", "Reward")
+	jsBlocksErr := tl("Impossible de charger les blocs du pool.", "Unable to load pool blocks.")
+	jsAgoFmt    := tl("il y a %v%s", "%v%s ago")
+
+	return `<style>
+.pool-wrap{max-width:960px;margin:0 auto;padding:2rem 1rem;}
+.pool-hero{margin-bottom:2.5rem;}
+.pool-hero h1{font-size:2rem;font-weight:700;color:#fff;margin-bottom:.5rem;}
+.pool-hero p{color:#8899aa;font-size:1rem;max-width:560px;}
+.pool-stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:1rem;margin-bottom:2rem;}
+.pool-stat-card{background:#0d1f35;border:1px solid #1a3a5c;border-radius:12px;padding:1.2rem 1rem;text-align:center;}
+.pool-stat-val{font-size:1.7rem;font-weight:700;color:#00ff88;font-variant-numeric:tabular-nums;}
+.pool-stat-val.blue{color:#4fc3f7;}
+.pool-stat-lbl{font-size:.72rem;color:#5577aa;text-transform:uppercase;letter-spacing:.08em;margin-top:.4rem;}
+.pool-section{margin-bottom:2rem;}
+.pool-section h2{font-size:1.1rem;font-weight:600;color:#cce0ff;margin-bottom:1rem;border-left:3px solid #1a3a5c;padding-left:.75rem;}
+.pool-table{width:100%;border-collapse:collapse;}
+.pool-table th{font-size:.72rem;color:#5577aa;text-transform:uppercase;letter-spacing:.06em;padding:.5rem .75rem;text-align:left;border-bottom:1px solid #1a3a5c;}
+.pool-table td{font-size:.88rem;color:#cce0ff;padding:.55rem .75rem;border-bottom:1px solid #0f2040;}
+.pool-table tr:last-child td{border-bottom:none;}
+.pool-table td.mono{font-family:monospace;font-size:.82rem;color:#aac4e0;}
+.pool-table td.green{color:#00ff88;}
+.pool-table td.blue{color:#4fc3f7;}
+.pool-table td.muted{color:#556677;}
+.pool-connect-box{background:#0d1f35;border:1px solid #1a3a5c;border-radius:12px;padding:1.5rem;}
+.pool-connect-box h3{font-size:1rem;font-weight:600;color:#cce0ff;margin-bottom:1rem;}
+.pool-connect-row{display:flex;align-items:center;gap:.75rem;margin-bottom:.75rem;flex-wrap:wrap;}
+.pool-connect-label{font-size:.78rem;color:#5577aa;text-transform:uppercase;letter-spacing:.06em;min-width:80px;}
+.pool-connect-val{font-family:monospace;font-size:.95rem;color:#00ff88;background:#060f1e;border:1px solid #1a3a5c;border-radius:6px;padding:.3rem .75rem;}
+.pool-steps{list-style:none;padding:0;margin:0;}
+.pool-steps li{display:flex;gap:1rem;margin-bottom:1rem;align-items:flex-start;}
+.pool-step-num{flex-shrink:0;width:28px;height:28px;border-radius:50%;background:#1a3a5c;color:#4fc3f7;font-size:.85rem;font-weight:700;display:flex;align-items:center;justify-content:center;}
+.pool-step-body{font-size:.9rem;color:#aac4e0;line-height:1.5;}
+.pool-step-body code{background:#060f1e;border:1px solid #1a3a5c;border-radius:4px;padding:.15rem .4rem;font-size:.82rem;color:#00ff88;}
+.pool-badge{display:inline-flex;align-items:center;gap:.35rem;background:#0a2010;border:1px solid #1a4a20;border-radius:20px;padding:.25rem .75rem;font-size:.82rem;color:#00ff88;}
+.pool-badge .dot{width:8px;height:8px;border-radius:50%;background:#00ff88;animation:blink-dot 1.4s infinite;}
+.pool-loading{color:#5577aa;font-size:.9rem;text-align:center;padding:2rem;}
+.pool-error{color:#ff6655;font-size:.85rem;padding:.5rem .75rem;background:#200a08;border:1px solid #4a1a10;border-radius:8px;}
+.pool-refresh-info{font-size:.75rem;color:#334455;margin-top:.5rem;text-align:right;}
+@media(max-width:680px){
+  .pool-stats-grid{grid-template-columns:1fr 1fr;}
+}
+@media(max-width:400px){
+  .pool-stats-grid{grid-template-columns:1fr;}
+}
+</style>
+
+<div class="pool-wrap">
+
+  <!-- Hero -->
+  <div class="pool-hero">
+    <div style="margin-bottom:.75rem;">
+      <span class="pool-badge"><span class="dot"></span> ` + poolOnline + `</span>
+    </div>
+    <h1>Scorbits Pool</h1>
+    <p>` + heroDesc + `</p>
+  </div>
+
+  <!-- Stats globales -->
+  <div class="pool-stats-grid" id="pool-stats-grid">
+    <div class="pool-stat-card"><div class="pool-stat-val blue" id="ps-hashrate">—</div><div class="pool-stat-lbl">` + lblHashrate + `</div></div>
+    <div class="pool-stat-card"><div class="pool-stat-val" id="ps-workers">—</div><div class="pool-stat-lbl">` + lblWorkers + `</div></div>
+    <div class="pool-stat-card"><div class="pool-stat-val blue" id="ps-blocks">—</div><div class="pool-stat-lbl">` + lblBlocks + `</div></div>
+    <div class="pool-stat-card"><div class="pool-stat-val" id="ps-fee">2%</div><div class="pool-stat-lbl">` + lblFee + `</div></div>
+    <div class="pool-stat-card"><div class="pool-stat-val" id="ps-countdown" style="font-size:1.3rem;">--:--:--</div><div class="pool-stat-lbl">` + lblCountdown + `</div></div>
+  </div>
+
+  <!-- Section : se connecter -->
+  <div class="pool-section">
+    <h2>` + h2Connect + `</h2>
+    <div class="pool-connect-box">
+      <div class="pool-connect-row">
+        <span class="pool-connect-label">` + lblServer + `</span>
+        <span class="pool-connect-val">51.91.122.48</span>
+      </div>
+      <div class="pool-connect-row">
+        <span class="pool-connect-label">Port</span>
+        <span class="pool-connect-val">3333</span>
+      </div>
+      <div class="pool-connect-row">
+        <span class="pool-connect-label">` + lblProtocol + `</span>
+        <span class="pool-connect-val">Stratum TCP</span>
+      </div>
+      <div class="pool-connect-row">
+        <span class="pool-connect-label">` + lblUser + `</span>
+        <span class="pool-connect-val">VOTRE_ADRESSE_SCO</span>
+      </div>
+      <div class="pool-connect-row">
+        <span class="pool-connect-label">` + lblPassword + `</span>
+        <span class="pool-connect-val">x</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Section : comment miner -->
+  <div class="pool-section">
+    <h2>` + h2HowTo + `</h2>
+    <ul class="pool-steps">
+      <li>
+        <div class="pool-step-num">1</div>
+        <div class="pool-step-body">` + step1Text + ` <a href="/mine" style="color:#4fc3f7;">` + step1Mine + `</a> ` + step1Src + `</div>
+      </li>
+      <li>
+        <div class="pool-step-num">2</div>
+        <div class="pool-step-body">` + step2Text + `<br>
+          <code>scorbits-miner-windows.exe --address VOTRE_ADRESSE_SCO --pool stratum+tcp://pool.scorbits.com:3333 --threads 4</code>
+        </div>
+      </li>
+      <li>
+        <div class="pool-step-num">3</div>
+        <div class="pool-step-body">` + step3Text + ` <a href="/wallet/dashboard" style="color:#4fc3f7;">` + step3Wallet + `</a>.</div>
+      </li>
+    </ul>
+  </div>
+
+  <!-- Section : workers connectés -->
+  <div class="pool-section">
+    <h2>` + h2Workers + ` <span id="workers-count" style="color:#5577aa;font-weight:400;font-size:.85rem;"></span></h2>
+    <div id="pool-workers-container"><div class="pool-loading">` + loadingTxt + `</div></div>
+    <div class="pool-refresh-info" id="pool-refresh-ts"></div>
+  </div>
+
+  <!-- Section : derniers blocs -->
+  <div class="pool-section">
+    <h2>` + h2Blocks + `</h2>
+    <div id="pool-blocks-container"><div class="pool-loading">` + loadingTxt + `</div></div>
+  </div>
+
+</div>
+
+<script>
+var POOL_API = '';
+var POOL_T = {
+  noWorkers:  "` + jsNoWorkers + `",
+  addrTh:     "` + jsAddrTh + `",
+  lastAct:    "` + jsLastAct + `",
+  lastUpd:    "` + jsLastUpd + `",
+  poolErr:    "` + jsPoolErr + `",
+  noBlocks:   "` + jsNoBlocks + `",
+  miner:      "` + jsMiner + `",
+  reward:     "` + jsReward + `",
+  blocksErr:  "` + jsBlocksErr + `",
+  agoFmt:     "` + jsAgoFmt + `"
+};
+
+function fmtHash(h) {
+  if (!h || h === 0) return '0 H/s';
+  if (h >= 1e9) return (h/1e9).toFixed(2) + ' GH/s';
+  if (h >= 1e6) return (h/1e6).toFixed(2) + ' MH/s';
+  if (h >= 1e3) return (h/1e3).toFixed(2) + ' KH/s';
+  return h + ' H/s';
+}
+
+function fmtTime(iso) {
+  if (!iso) return '—';
+  var d = new Date(iso);
+  if (isNaN(d.getTime())) return '—';
+  var now = new Date();
+  var diff = Math.floor((now - d) / 1000);
+  var fmt = POOL_T.agoFmt;
+  function ago(n, unit) { return fmt.replace('%v', n).replace('%s', unit); }
+  if (diff < 60) return ago(diff, 's');
+  if (diff < 3600) return ago(Math.floor(diff/60), 'min');
+  if (diff < 86400) return ago(Math.floor(diff/3600), 'h');
+  return d.toLocaleDateString();
+}
+
+function shortHash(h) {
+  if (!h || h.length < 16) return h || '—';
+  return h.slice(0,8) + '...' + h.slice(-8);
+}
+
+function loadStats() {
+  fetch(POOL_API + '/api/proxy/pool/stats')
+    .then(function(r){ return r.json(); })
+    .then(function(d) {
+      document.getElementById('ps-hashrate').textContent = fmtHash(d.pool_hashrate || 0);
+      document.getElementById('ps-workers').textContent = d.workers_online || 0;
+      document.getElementById('ps-blocks').textContent = d.blocks_found || 0;
+    })
+    .catch(function(){
+      document.getElementById('ps-hashrate').textContent = 'N/A';
+    });
+}
+
+function loadWorkers() {
+  fetch(POOL_API + '/api/proxy/pool/workers')
+    .then(function(r){ return r.json(); })
+    .then(function(workers) {
+      var count = workers ? workers.length : 0;
+      document.getElementById('workers-count').textContent = '(' + count + ')';
+      var c = document.getElementById('pool-workers-container');
+      if (!count) {
+        c.innerHTML = '<div class="pool-loading">' + POOL_T.noWorkers + '</div>';
+        return;
+      }
+      var rows = workers.map(function(w) {
+        return '<tr>' +
+          '<td class="mono">' + (w.address ? w.address.slice(0,10)+'...'+w.address.slice(-6) : '—') + '</td>' +
+          '<td>' + (w.worker || 'worker') + '</td>' +
+          '<td class="blue">' + fmtHash(w.hashrate || 0) + '</td>' +
+          '<td class="green">' + (w.shares_valid || 0) + '</td>' +
+          '<td class="muted">' + fmtTime(w.last_share) + '</td>' +
+        '</tr>';
+      }).join('');
+      c.innerHTML = '<table class="pool-table"><thead><tr>' +
+        '<th>' + POOL_T.addrTh + '</th><th>Worker</th><th>Hashrate</th><th>Shares</th><th>' + POOL_T.lastAct + '</th>' +
+        '</tr></thead><tbody>' + rows + '</tbody></table>';
+      var now = new Date();
+      document.getElementById('pool-refresh-ts').textContent = POOL_T.lastUpd + ' ' + now.toLocaleTimeString();
+    })
+    .catch(function() {
+      document.getElementById('pool-workers-container').innerHTML =
+        '<div class="pool-error">' + POOL_T.poolErr + '</div>';
+    });
+}
+
+function loadBlocks() {
+  fetch(POOL_API + '/api/proxy/pool/blocks')
+    .then(function(r){ return r.json(); })
+    .then(function(blocks) {
+      var c = document.getElementById('pool-blocks-container');
+      if (!blocks || !blocks.length) {
+        c.innerHTML = '<div class="pool-loading">' + POOL_T.noBlocks + '</div>';
+        return;
+      }
+      var rows = blocks.slice(0,20).map(function(b) {
+        var addr = b.FoundBy || '';
+        var addrShort = addr ? addr.slice(0,10)+'...'+addr.slice(-6) : '—';
+        return '<tr>' +
+          '<td class="blue">#' + (b.BlockIndex || '?') + '</td>' +
+          '<td class="mono">' + shortHash(b.BlockHash || '') + '</td>' +
+          '<td class="mono">' + addrShort + '</td>' +
+          '<td class="green">' + (b.NetReward || b.Reward || 11) + ' SCO</td>' +
+          '<td class="muted">' + fmtTime(b.Timestamp || '') + '</td>' +
+        '</tr>';
+      }).join('');
+      c.innerHTML = '<table class="pool-table"><thead><tr>' +
+        '<th>Bloc</th><th>Hash</th><th>' + POOL_T.miner + '</th><th>' + POOL_T.reward + '</th><th>Date</th>' +
+        '</tr></thead><tbody>' + rows + '</tbody></table>';
+    })
+    .catch(function() {
+      document.getElementById('pool-blocks-container').innerHTML =
+        '<div class="pool-error">' + POOL_T.blocksErr + '</div>';
+    });
+}
+
+function refreshAll() {
+  loadStats();
+  loadWorkers();
+  loadBlocks();
+}
+
+refreshAll();
+setInterval(refreshAll, 30000);
+
+function updateCountdown() {
+  var now = new Date();
+  var totalSeconds = now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds();
+  var cycleSeconds = 12 * 3600;
+  var nextPayout = cycleSeconds - (totalSeconds % cycleSeconds);
+  var h = Math.floor(nextPayout / 3600);
+  var m = Math.floor((nextPayout % 3600) / 60);
+  var s = nextPayout % 60;
+  var el = document.getElementById('ps-countdown');
+  if (el) el.textContent = String(h).padStart(2,'0') + ':' + String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
+}
+updateCountdown();
+setInterval(updateCountdown, 1000);
+</script>
+`
+}
+
+// ─── Pool proxy handlers (relay browser requests to localhost:3334) ────────────
+
+const poolBackend = "http://localhost:3334"
+
+func proxyPoolEndpoint(w http.ResponseWriter, target string) {
+	resp, err := http.Get(target)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(502)
+		fmt.Fprintf(w, `{"error":"pool unreachable"}`)
+		return
+	}
+	defer resp.Body.Close()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+}
+
+func (e *Explorer) apiProxyPoolStats(w http.ResponseWriter, r *http.Request) {
+	proxyPoolEndpoint(w, poolBackend+"/api/pool/stats")
+}
+
+func (e *Explorer) apiProxyPoolWorkers(w http.ResponseWriter, r *http.Request) {
+	proxyPoolEndpoint(w, poolBackend+"/api/pool/workers")
+}
+
+func (e *Explorer) apiProxyPoolBlocks(w http.ResponseWriter, r *http.Request) {
+	proxyPoolEndpoint(w, poolBackend+"/api/pool/blocks")
+}
+
+func (e *Explorer) apiProxyPoolBalance(w http.ResponseWriter, r *http.Request) {
+	address := r.URL.Query().Get("address")
+	proxyPoolEndpoint(w, poolBackend+"/api/pool/balance?address="+address)
 }

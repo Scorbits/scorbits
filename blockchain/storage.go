@@ -9,17 +9,19 @@ import (
 const ChainFile = "scorbits_chain.json"
 
 type ChainData struct {
-	Blocks     []*Block `json:"blocks"`
-	Difficulty int      `json:"difficulty"`
-	TotalSupply int     `json:"total_supply"`
+	Blocks           []*Block `json:"blocks"`
+	Difficulty       int      `json:"difficulty"`
+	TotalSupply      int      `json:"total_supply"`
+	DifficultyForced bool     `json:"difficulty_forced"`
 }
 
 // Save sauvegarde la blockchain sur disque
 func (bc *Blockchain) Save() error {
 	data := ChainData{
-		Blocks:      bc.Blocks,
-		Difficulty:  bc.Difficulty,
-		TotalSupply: bc.TotalSupply,
+		Blocks:           bc.Blocks,
+		Difficulty:       bc.Difficulty,
+		TotalSupply:      bc.TotalSupply,
+		DifficultyForced: bc.DifficultyForced,
 	}
 	bytes, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
@@ -56,9 +58,10 @@ func Load() (*Blockchain, error) {
 	}
 
 	bc := &Blockchain{
-		Blocks:      data.Blocks,
-		Difficulty:  data.Difficulty,
-		TotalSupply: data.TotalSupply,
+		Blocks:           data.Blocks,
+		Difficulty:       data.Difficulty,
+		TotalSupply:      data.TotalSupply,
+		DifficultyForced: data.DifficultyForced,
 	}
 
 	if !bc.IsValid() {

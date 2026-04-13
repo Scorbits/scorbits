@@ -246,15 +246,26 @@ type Post struct {
 	CreatedAt    time.Time     `bson:"created_at" json:"created_at"`
 }
 
+type CommentReply struct {
+	ID        bson.ObjectID `bson:"_id,omitempty" json:"id"`
+	UserID    bson.ObjectID `bson:"user_id" json:"user_id"`
+	Pseudo    string        `bson:"pseudo" json:"pseudo"`
+	AvatarSVG string        `bson:"avatar_svg" json:"avatar_svg"`
+	Content   string        `bson:"content" json:"content"`
+	CreatedAt time.Time     `bson:"created_at" json:"created_at"`
+}
+
 type Comment struct {
-	ID           bson.ObjectID `bson:"_id,omitempty" json:"id"`
-	PostID       bson.ObjectID `bson:"post_id" json:"post_id"`
-	UserID       bson.ObjectID `bson:"user_id" json:"user_id"`
-	Pseudo       string        `bson:"pseudo" json:"pseudo"`
-	AvatarSVG    string        `bson:"avatar_svg" json:"avatar_svg"`
-	Content      string        `bson:"content" json:"content"`
-	UserReaction string        `bson:"-" json:"user_reaction,omitempty"`
-	CreatedAt    time.Time     `bson:"created_at" json:"created_at"`
+	ID           bson.ObjectID  `bson:"_id,omitempty" json:"id"`
+	PostID       bson.ObjectID  `bson:"post_id" json:"post_id"`
+	UserID       bson.ObjectID  `bson:"user_id" json:"user_id"`
+	Pseudo       string         `bson:"pseudo" json:"pseudo"`
+	AvatarSVG    string         `bson:"avatar_svg" json:"avatar_svg"`
+	Content      string         `bson:"content" json:"content"`
+	UserReaction string         `bson:"-" json:"user_reaction,omitempty"`
+	Likes        []string       `bson:"likes" json:"likes"`
+	Replies      []CommentReply `bson:"replies" json:"replies"`
+	CreatedAt    time.Time      `bson:"created_at" json:"created_at"`
 }
 
 // ─── REACTIONS ────────────────────────────────────────────────────────────────
@@ -430,6 +441,71 @@ func AdminDeleteComment(commentID bson.ObjectID) error {
 	defer cancel()
 	Collection("comments").DeleteOne(ctx, bson.M{"_id": commentID})
 	return nil
+}
+
+// GetCommentByID retourne un commentaire par son ID.
+func GetCommentByID(commentID bson.ObjectID) (*Comment, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var c Comment
+	err := Collection("comments").FindOne(ctx, bson.M{"_id": commentID}).Decode(&c)
+	if err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+// ToggleCommentLike ajoute ou retire userIDHex des likes du commentaire.
+// Retourne (liked=true si ajouté, newCount, err).
+func ToggleCommentLike(commentID bson.ObjectID, userIDHex string) (liked bool, newCount int, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Vérifier si déjà liké
+	var c Comment
+	err = Collection("comments").FindOne(ctx, bson.M{"_id": commentID}).Decode(&c)
+	if err != nil {
+		return false, 0, err
+	}
+	already := false
+	for _, uid := range c.Likes {
+		if uid == userIDHex {
+			already = true
+			break
+		}
+	}
+
+	var update bson.M
+	if already {
+		update = bson.M{"$pull": bson.M{"likes": userIDHex}}
+		liked = false
+	} else {
+		update = bson.M{"$addToSet": bson.M{"likes": userIDHex}}
+		liked = true
+	}
+	_, err = Collection("comments").UpdateOne(ctx, bson.M{"_id": commentID}, update)
+	if err != nil {
+		return false, 0, err
+	}
+	if already {
+		newCount = len(c.Likes) - 1
+	} else {
+		newCount = len(c.Likes) + 1
+	}
+	return liked, newCount, nil
+}
+
+// AddCommentReply ajoute une réponse imbriquée à un commentaire.
+func AddCommentReply(commentID bson.ObjectID, reply CommentReply) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	reply.ID = bson.NewObjectID()
+	reply.CreatedAt = time.Now()
+	_, err := Collection("comments").UpdateOne(ctx,
+		bson.M{"_id": commentID},
+		bson.M{"$push": bson.M{"replies": reply}},
+	)
+	return err
 }
 
 func AdminDeleteChatMessage(msgID bson.ObjectID) error {
@@ -1073,6 +1149,23 @@ func GetNotifications(userID bson.ObjectID) ([]*Notification, error) {
 	return notifs, nil
 }
 
+func GetNotificationsSince(userID bson.ObjectID, since time.Time) ([]*Notification, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	opts := options.Find().SetSort(bson.D{{Key: "created_at", Value: -1}}).SetLimit(20)
+	cur, err := Collection("notifications").Find(ctx, bson.M{
+		"user_id":    userID,
+		"created_at": bson.M{"$gt": since},
+	}, opts)
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(ctx)
+	var notifs []*Notification
+	cur.All(ctx, &notifs)
+	return notifs, nil
+}
+
 func MarkAllNotificationsRead(userID bson.ObjectID) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -1106,5 +1199,59 @@ func UpdateGroupName(groupID bson.ObjectID, name string) error {
 		bson.M{"_id": groupID},
 		bson.M{"$set": bson.M{"name": name}},
 	)
+	return err
+}
+
+// ─── ANNOUNCEMENTS ────────────────────────────────────────────────────────────
+
+type Announcement struct {
+	ID        bson.ObjectID `bson:"_id,omitempty" json:"id"`
+	Title     string        `bson:"title" json:"title"`
+	Content   string        `bson:"content" json:"content"`
+	MediaURL  string        `bson:"media_url,omitempty" json:"media_url,omitempty"`
+	CreatedAt time.Time     `bson:"created_at" json:"created_at"`
+	UpdatedAt time.Time     `bson:"updated_at" json:"updated_at"`
+}
+
+func CreateAnnouncement(a *Announcement) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	a.ID = bson.NewObjectID()
+	a.CreatedAt = time.Now()
+	a.UpdatedAt = time.Now()
+	_, err := Collection("announcements").InsertOne(ctx, a)
+	return err
+}
+
+func GetAnnouncements() ([]*Announcement, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	opts := options.Find().SetSort(bson.D{{Key: "created_at", Value: -1}})
+	cur, err := Collection("announcements").Find(ctx, bson.M{}, opts)
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(ctx)
+	var list []*Announcement
+	if err := cur.All(ctx, &list); err != nil {
+		return nil, err
+	}
+	return list, nil
+}
+
+func UpdateAnnouncement(id bson.ObjectID, title, content, mediaURL string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := Collection("announcements").UpdateOne(ctx,
+		bson.M{"_id": id},
+		bson.M{"$set": bson.M{"title": title, "content": content, "media_url": mediaURL, "updated_at": time.Now()}},
+	)
+	return err
+}
+
+func DeleteAnnouncement(id bson.ObjectID) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := Collection("announcements").DeleteOne(ctx, bson.M{"_id": id})
 	return err
 }

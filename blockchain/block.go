@@ -27,6 +27,7 @@ type Block struct {
 	Difficulty   int
 	Reward       int
 	MinerAddress string
+	AcceptedAt   int64 `json:"accepted_at"` // timestamp réel serveur à l'acceptation du bloc
 }
 
 // CalculateHash computes SHA256(index+timestamp+txData+previousHash+nonce+minerAddress)

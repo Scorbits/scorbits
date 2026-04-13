@@ -9,7 +9,7 @@ import (
 
 const (
 	TargetBlockTime    = 3 * 60 // 180 secondes
-	DifficultyInterval = 5      // ajustement tous les 5 blocs (~15 min)
+	DifficultyInterval = 10     // ajustement tous les 10 blocs (~40 min)
 	MaxDifficulty      = 32     // plafond prod
 	MinDifficulty      = 4      // plancher
 
@@ -32,9 +32,10 @@ var Checkpoints = map[int]string{
 }
 
 type Blockchain struct {
-	Blocks      []*Block
-	Difficulty  int
-	TotalSupply int
+	Blocks           []*Block
+	Difficulty       int
+	TotalSupply      int
+	DifficultyForced bool
 }
 
 func NewBlockchain() *Blockchain {
@@ -50,28 +51,19 @@ func (bc *Blockchain) GetLastBlock() *Block {
 	return bc.Blocks[len(bc.Blocks)-1]
 }
 
-// AdjustDifficulty — ajustement ±1 selon que les blocs arrivent trop vite ou trop lentement.
-// Si elapsed < target → monte d'1, sinon descend d'1, plancher MinDifficulty.
+// AdjustDifficulty — ajustement asymétrique basé sur le temps réel des 5 derniers blocs.
+// Si elapsed < target (blocs trop rapides) → +3 ; sinon → -1. Cible : 4 min/bloc.
 func (bc *Blockchain) AdjustDifficulty() int {
 	if len(bc.Blocks) < DifficultyInterval {
 		return bc.Difficulty
 	}
-
-	last := bc.Blocks[len(bc.Blocks)-1]
 	first := bc.Blocks[len(bc.Blocks)-DifficultyInterval]
-
-	// Si la fenêtre inclut le genesis, son timestamp ancien fausserait elapsed.
-	if first.Index == 0 {
-		return bc.Difficulty
-	}
-
+	last := bc.Blocks[len(bc.Blocks)-1]
 	elapsed := last.Timestamp - first.Timestamp
 	if elapsed <= 0 {
-		elapsed = 1
+		return bc.Difficulty
 	}
-
-	target := int64(TargetBlockTime * DifficultyInterval) // 5 × 180 = 900s
-
+	target := int64(4 * 60 * DifficultyInterval) // 4 min × 5 blocs = 1200s
 	if elapsed < target {
 		newDiff := bc.Difficulty + 1
 		if newDiff > MaxDifficulty {
@@ -89,16 +81,13 @@ func (bc *Blockchain) AdjustDifficulty() int {
 // waitBeforeBlock applique l'anti-spike avant de créer un bloc :
 // minimum 10s depuis le dernier bloc (toujours actif).
 func (bc *Blockchain) waitBeforeBlock(previous *Block, nextIndex int) {
-	minTs := previous.Timestamp + 10
+	minTs := previous.Timestamp + 120
 	if now := time.Now().Unix(); now < minTs {
 		time.Sleep(time.Duration(minTs-now) * time.Second)
 	}
 }
 
 func (bc *Blockchain) AddBlock(transactions []string, minerAddress string) *Block {
-	if (len(bc.Blocks)-1)%DifficultyInterval == 0 {
-		bc.Difficulty = bc.AdjustDifficulty()
-	}
 	previous := bc.GetLastBlock()
 	nextIndex := previous.Index + 1
 	bc.waitBeforeBlock(previous, nextIndex)
@@ -110,9 +99,6 @@ func (bc *Blockchain) AddBlock(transactions []string, minerAddress string) *Bloc
 
 // AddBlockMulti crée et mine un bloc avec threads goroutines en parallèle.
 func (bc *Blockchain) AddBlockMulti(transactions []string, minerAddress string, threads int) *Block {
-	if (len(bc.Blocks)-1)%DifficultyInterval == 0 {
-		bc.Difficulty = bc.AdjustDifficulty()
-	}
 	previous := bc.GetLastBlock()
 	nextIndex := previous.Index + 1
 	bc.waitBeforeBlock(previous, nextIndex)
@@ -164,6 +150,16 @@ func (bc *Blockchain) FindCommonAncestor(incoming []*Block) int {
 		}
 	}
 	return 0 // genesis = ancêtre commun minimum
+}
+
+// IsConsecutiveMiner retourne true si minerAddress a miné les 2 derniers blocs consécutifs.
+// Dans ce cas le prochain bloc de ce mineur doit être refusé.
+func (bc *Blockchain) IsConsecutiveMiner(minerAddress string) bool {
+	n := len(bc.Blocks)
+	if n < 1 {
+		return false
+	}
+	return bc.Blocks[n-1].MinerAddress == minerAddress
 }
 
 // ActiveMinersLast24h retourne le nombre d'adresses de mineurs uniques
